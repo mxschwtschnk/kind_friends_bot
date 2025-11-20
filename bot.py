@@ -4,7 +4,7 @@ import asyncio
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 import asyncpg
 
 # -------------------------------------------------------------------
@@ -15,6 +15,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "KindFriendsBot")  # without @
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram ID
+FEEDBACK_BOT_TOKEN = os.getenv("FEEDBACK_BOT_TOKEN")
+FEEDBACK_RECIPIENT_CHAT_ID = int(os.getenv("FEEDBACK_RECIPIENT_CHAT_ID", "0"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -22,10 +24,13 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
 bot = Bot(token=BOT_TOKEN)
+feedback_bot = Bot(token=FEEDBACK_BOT_TOKEN) if FEEDBACK_BOT_TOKEN else None
 dp = Dispatcher()
 
 pool: asyncpg.Pool | None = None
 add_friend_mode = set()  # user_ids who are adding a friend
+remove_friend_mode = set()  # user_ids who are removing a friend
+feedback_mode = set()  # user_ids who are sending feedback
 
 
 # -------------------------------------------------------------------
@@ -340,10 +345,10 @@ def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
     pause_button = "▶️ Resume" if paused else "⏸ Pause"
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📤 Send a link")],
             [KeyboardButton(text="➕ Invite friends"), KeyboardButton(text="👥 Friends")],
+            [KeyboardButton(text="➖ Remove friend")],
             [KeyboardButton(text=pause_button)],
-            [KeyboardButton(text="ℹ️ Help"), KeyboardButton(text="💡 Feedback")],
+            [KeyboardButton(text="ℹ️ Help")],
         ],
         resize_keyboard=True,
     )
@@ -368,7 +373,7 @@ async def cmd_start(message: types.Message):
         "I help friends share important links with each other.\n\n"
         "• Paste a link here – I will treat it as something you want to share.\n"
         "• Use the buttons below to invite friends, see your list,\n"
-        "  pause/resume, or send feedback.\n",
+        "  manage friends, or pause/resume.\n",
         reply_markup=main_keyboard(paused),
     )
 
@@ -384,10 +389,15 @@ async def help_handler(message: types.Message):
         "support your friend (like, comment, share, sign up, etc.).\n\n"
         "How to use me:\n"
         "• Just paste a link directly into this chat — that’s enough.\n"
-        "• Use the buttons to invite friends, manage your list, pause/resume,\n"
-        "  or send feedback and ideas.\n"
+        "• Use the buttons to invite friends, manage your list, or pause/resume.\n\n"
+        "Want to share feedback or ideas? Tap the button below.",
     )
-    await message.answer(text)
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="💡 Send feedback", callback_data="start_feedback")]]
+        ),
+    )
 
 
 @dp.message(F.text == "⏸ Pause")
@@ -457,6 +467,7 @@ async def resume_handler(message: types.Message):
 async def invite_friends_handler(message: types.Message):
     user_id = message.from_user.id
     add_friend_mode.add(user_id)
+    remove_friend_mode.discard(user_id)
     await message.answer(
         "Send me your friend's Telegram @username (for example @username).\n"
         "If they have not started Kind Friends yet, I will give you an invite link."
@@ -478,19 +489,39 @@ async def friends_handler(message: types.Message):
     lines = [f"- @{u}" for u in friends]
     text = (
         "Your friends:\n" + "\n".join(lines) +
-        "\n\nTo remove a friend, send their @username starting with a minus, for example:\n"
-        "`-@username`"
+        "\n\nTo remove someone, tap “➖ Remove friend” and choose who to disconnect."
     )
     await message.answer(text, parse_mode="Markdown")
 
 
-@dp.message(F.text == "💡 Feedback")
-async def feedback_handler(message: types.Message):
+@dp.message(F.text == "➖ Remove friend")
+async def remove_friend_handler(message: types.Message):
+    user_id = message.from_user.id
+    friends = await get_friend_usernames(user_id)
+
+    if not friends:
+        await message.answer(
+            "You don't have any friends connected yet.\n"
+            "Tap “➕ Invite friends” to add someone."
+        )
+        return
+
+    remove_friend_mode.add(user_id)
+    add_friend_mode.discard(user_id)
     await message.answer(
-        "Please type your feedback or ideas in one message and send it here.\n\n"
-        "(In this minimal version it will not be saved yet,\n"
-        "but later it can be forwarded to the creator.)"
+        "Send me the @username of the friend you want to remove.\n"
+        "You can copy it from the list in “👥 Friends”."
     )
+
+
+@dp.callback_query(F.data == "start_feedback")
+async def start_feedback(callback: types.CallbackQuery):
+    feedback_mode.add(callback.from_user.id)
+    await callback.message.answer(
+        "Thanks for willing to share feedback!\n"
+        "Send your thoughts in one message and I'll pass it along."
+    )
+    await callback.answer()
 
 
 @dp.message(F.text == "/admin")
@@ -550,6 +581,30 @@ async def generic_handler(message: types.Message):
     user_id = message.from_user.id
     text = message.text or ""
 
+    # 0) Feedback mode
+    if user_id in feedback_mode:
+        feedback_mode.discard(user_id)
+        if not feedback_bot or not FEEDBACK_RECIPIENT_CHAT_ID:
+            await message.answer(
+                "I couldn't deliver your feedback because the feedback bot isn't configured yet."
+            )
+            return
+
+        try:
+            await feedback_bot.send_message(
+                FEEDBACK_RECIPIENT_CHAT_ID,
+                (
+                    "💡 New feedback\n"
+                    f"From: @{message.from_user.username or 'unknown'} (ID: {user_id})\n\n"
+                    f"{text}"
+                ),
+            )
+            await message.answer("Thanks! I sent your feedback to the creator 💌")
+        except Exception as e:
+            print(f"[WARN] Failed to forward feedback: {e}")
+            await message.answer("Sorry, I couldn't deliver your feedback right now.")
+        return
+
     # 1) Add friend mode
     if user_id in add_friend_mode and text.startswith("@"):
         add_friend_mode.discard(user_id)
@@ -586,6 +641,25 @@ async def generic_handler(message: types.Message):
         await message.answer(
             f"You are now connected with @{clean_username}. "
             "You can share links with each other."
+        )
+        return
+
+    # 1.5) Remove friend mode
+    if user_id in remove_friend_mode:
+        remove_friend_mode.discard(user_id)
+        friend_username_raw = text.lstrip("@").strip()
+        if not friend_username_raw:
+            await message.answer("Please send a valid @username to remove a friend.")
+            return
+
+        friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+        if not friend_tg_id:
+            await message.answer("I can't find this friend in Kind Friends.")
+            return
+
+        await remove_friendship(user_id, friend_tg_id)
+        await message.answer(
+            f"You are no longer connected with @{friend_username_raw} on Kind Friends."
         )
         return
 
@@ -691,6 +765,8 @@ async def on_shutdown(app):
     if bot_task:
         bot_task.cancel()
     await bot.session.close()
+    if feedback_bot:
+        await feedback_bot.session.close()
     print("Kind Friends bot stopped.")
 
 
