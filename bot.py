@@ -1,5 +1,7 @@
 import os
 
+import asyncio
+
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -19,6 +21,7 @@ FEEDBACK_BOT_TOKEN = os.getenv("FEEDBACK_BOT_TOKEN")
 FEEDBACK_RECIPIENT_CHAT_ID = int(os.getenv("FEEDBACK_RECIPIENT_CHAT_ID", "0"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+USE_POLLING = os.getenv("USE_POLLING", "false").lower() in {"1", "true", "yes"}
 
 if not WEBHOOK_URL and RENDER_EXTERNAL_URL:
     WEBHOOK_URL = RENDER_EXTERNAL_URL.rstrip("/") + "/webhook"
@@ -27,7 +30,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
-if not WEBHOOK_URL:
+if not WEBHOOK_URL and not USE_POLLING:
     raise RuntimeError("WEBHOOK_URL is not set and RENDER_EXTERNAL_URL is missing")
 
 bot = Bot(token=BOT_TOKEN)
@@ -909,7 +912,19 @@ async def on_shutdown(app):
     print("Kind Friends bot stopped.")
 
 
-def main():
+async def start_polling():
+    """
+    Optional fallback for environments where webhook hosting is not available.
+
+    Deletes any existing webhook (so Telegram stops rejecting getUpdates) and
+    starts long polling after the database is ready.
+    """
+    await init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+def run_webhook_app():
     app = web.Application()
     app.router.add_get("/", healthcheck)
 
@@ -921,6 +936,13 @@ def main():
 
     port = int(os.getenv("PORT", 10000))
     web.run_app(app, host="0.0.0.0", port=port)
+
+
+def main():
+    if USE_POLLING:
+        asyncio.run(start_polling())
+    else:
+        run_webhook_app()
 
 
 if __name__ == "__main__":
