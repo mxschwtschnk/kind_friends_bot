@@ -2,11 +2,9 @@ import os
 
 import asyncio
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 import asyncpg
 
 # -------------------------------------------------------------------
@@ -19,20 +17,11 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "KindFriendsBot")  # without @
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram ID
 FEEDBACK_BOT_TOKEN = os.getenv("FEEDBACK_BOT_TOKEN")
 FEEDBACK_RECIPIENT_CHAT_ID = int(os.getenv("FEEDBACK_RECIPIENT_CHAT_ID", "0"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
-WEBHOOK_REFRESH_TOKEN = os.getenv("WEBHOOK_REFRESH_TOKEN")
-USE_POLLING = os.getenv("USE_POLLING", "false").lower() in {"1", "true", "yes"}
-
-if not WEBHOOK_URL and RENDER_EXTERNAL_URL:
-    WEBHOOK_URL = RENDER_EXTERNAL_URL.rstrip("/") + "/webhook"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
-if not WEBHOOK_URL and not USE_POLLING:
-    raise RuntimeError("WEBHOOK_URL is not set and RENDER_EXTERNAL_URL is missing")
 
 bot = Bot(token=BOT_TOKEN)
 feedback_bot = Bot(token=FEEDBACK_BOT_TOKEN) if FEEDBACK_BOT_TOKEN else None
@@ -936,112 +925,22 @@ async def generic_handler(message: types.Message):
         )
 
 
-# -------------------------------------------------------------------
-# AIOHTTP APP + WEBHOOK
-# -------------------------------------------------------------------
-
-async def healthcheck(request):
-    """
-    Simple endpoint so Render sees an open port.
-    """
-    refreshed = await ensure_webhook()
-    return web.json_response({"status": "ok", "webhook": WEBHOOK_URL, "refreshed": refreshed})
-
-
-async def ensure_webhook(force: bool = False) -> bool:
-    """
-    Verify webhook configuration and re-register if it is missing or wrong.
-
-    Returns True if we had to change anything.
-    """
-    try:
-        info = await bot.get_webhook_info()
-        needs_refresh = force or info.url != WEBHOOK_URL
-        if needs_refresh:
-            await bot.set_webhook(WEBHOOK_URL)
-            print(f"Refreshed webhook to {WEBHOOK_URL}")
-            return True
-        return False
-    except Exception as e:  # noqa: BLE001
-        print(f"[ERROR] Failed to verify or set webhook: {e}")
-        return False
-
-
-async def refresh_webhook(request):
-    """
-    Manually refresh webhook configuration.
-
-    If WEBHOOK_REFRESH_TOKEN is set, the caller must pass it as ?token=<token>.
-    """
-    if WEBHOOK_REFRESH_TOKEN:
-        token = request.query.get("token")
-        if token != WEBHOOK_REFRESH_TOKEN:
-            return web.Response(status=403, text="Invalid token")
-
-    refreshed = await ensure_webhook(force=True)
-    return web.json_response({"refreshed": refreshed, "webhook": WEBHOOK_URL})
-
-
-async def on_startup(app):
-    """
-    On startup:
-    - init DB
-    - set webhook
-    """
-    await init_db()
-    await bot.delete_webhook(drop_pending_updates=True)
-    refreshed = await ensure_webhook(force=True)
-    if refreshed:
-        print(f"Kind Friends webhook set to {WEBHOOK_URL}")
-    else:
-        print(f"Kind Friends webhook already set to {WEBHOOK_URL}")
-
-
-async def on_shutdown(app):
-    """
-    On shutdown:
-    - remove webhook
-    - close bot session
-    """
-    await bot.delete_webhook()
-    await bot.session.close()
-    if feedback_bot:
-        await feedback_bot.session.close()
-    print("Kind Friends bot stopped.")
-
-
 async def start_polling():
     """
-    Optional fallback for environments where webhook hosting is not available.
-
-    Deletes any existing webhook (so Telegram stops rejecting getUpdates) and
-    starts long polling after the database is ready.
+    Start the bot in long polling mode after ensuring the database exists.
     """
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-
-def run_webhook_app():
-    app = web.Application()
-    app.router.add_get("/", healthcheck)
-    app.router.add_get("/refresh-webhook", refresh_webhook)
-
-    webhook_handler = SimpleRequestHandler(dp, bot)
-    webhook_handler.register(app, path="/webhook")
-
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    port = int(os.getenv("PORT", 10000))
-    web.run_app(app, host="0.0.0.0", port=port)
-
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        if feedback_bot:
+            await feedback_bot.session.close()
+        print("Kind Friends bot stopped.")
 
 def main():
-    if USE_POLLING:
-        asyncio.run(start_polling())
-    else:
-        run_webhook_app()
+    asyncio.run(start_polling())
 
 
 if __name__ == "__main__":
