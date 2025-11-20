@@ -449,25 +449,43 @@ async def generic_handler(message: types.Message):
 
     # 1) Add friend mode
     if user_id in add_friend_mode and text.startswith("@"):
-        add_friend_mode.discard(user_id)
-        friend_username_raw = text.strip()
-        friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-        if not friend_tg_id:
-            await message.answer(
-                "I can't find this user in Kind Friends yet.\n"
-                "Ask them to start the bot at least once, then try again."
-            )
-            return
-        if friend_tg_id == user_id:
-            await message.answer("You cannot add yourself as a friend 🙂")
-            return
+    add_friend_mode.discard(user_id)
+    friend_username_raw = text.strip().lstrip("@").lower()
 
-        await add_mutual_friendship(user_id, friend_tg_id)
+    # Try to find friend in DB
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+
+    if not friend_tg_id:
+        # friend not in Kind Friends yet → give invite link
+        invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
         await message.answer(
-            f"You are now connected with {friend_username_raw}. "
-            "You can share links with each other."
+            "Your friend hasn't started **Kind Friends** yet.\n\n"
+            "Send them this link and ask them to press Start:\n"
+            f"{invite_link}"
         )
         return
+
+    if friend_tg_id == user_id:
+        await message.answer("You cannot add yourself 🙂")
+        return
+
+    await add_mutual_friendship(user_id, friend_tg_id)
+
+    # Notify friend (if possible)
+    try:
+        await bot.send_message(
+            friend_tg_id,
+            f"@{message.from_user.username} added you as a friend on **Kind Friends** 🎉"
+        )
+    except:
+        pass
+
+    await message.answer(
+        f"You are now connected with @{friend_username_raw}. "
+        "You can share links with each other."
+    )
+    return
+
 
     # 2) Remove friend: -@username
     if text.startswith("-@"):
