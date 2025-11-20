@@ -410,8 +410,7 @@ def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
     else:
         keyboard = [
             [KeyboardButton(text="👥 Friends")],
-            [KeyboardButton(text="⏸ Pause")],
-            [KeyboardButton(text="ℹ️ Help")],
+            [KeyboardButton(text="⏸ Pause"), KeyboardButton(text="ℹ️ Help")],
         ]
 
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -431,11 +430,17 @@ def friends_keyboard() -> ReplyKeyboardMarkup:
 def help_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📖 How to")],
+            [KeyboardButton(text="📖 How to"), KeyboardButton(text="💬 Feedback")],
             [KeyboardButton(text="🗑 Delete Account")],
-            [KeyboardButton(text="💬 Feedback")],
             [KeyboardButton(text="⬅️ Back")],
         ],
+        resize_keyboard=True,
+    )
+
+
+def feedback_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="⬅️ Back")]],
         resize_keyboard=True,
     )
 
@@ -508,6 +513,11 @@ async def cmd_start(message: types.Message):
     )
 
 
+@dp.message(F.text == "Start")
+async def start_text_handler(message: types.Message):
+    await cmd_start(message)
+
+
 @dp.message(F.text == "ℹ️ Help")
 async def help_handler(message: types.Message):
     await message.answer(
@@ -535,7 +545,7 @@ async def delete_account_prompt(message: types.Message):
         "Continue?",
         reply_markup=ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="✅ Yes, delete"), KeyboardButton(text="❌ No, keep my account")],
+                [KeyboardButton(text="Yes, delete"), KeyboardButton(text="No, keep my account")],
             ],
             resize_keyboard=True,
         ),
@@ -547,7 +557,7 @@ async def start_feedback_from_menu(message: types.Message):
     feedback_mode.add(message.from_user.id)
     await message.answer(
         "Thanks for willing to share feedback!\nSend your thoughts in one message and I'll pass it along.",
-        reply_markup=help_keyboard(),
+        reply_markup=feedback_keyboard(),
     )
 
 
@@ -688,7 +698,7 @@ async def start_feedback(callback: types.CallbackQuery):
     await callback.message.answer(
         "Thanks for willing to share feedback!\n"
         "Send your thoughts in one message and I'll pass it along.",
-        reply_markup=help_keyboard(),
+        reply_markup=feedback_keyboard(),
     )
     await callback.answer()
 
@@ -784,13 +794,13 @@ async def generic_handler(message: types.Message):
         # 0.1) Delete confirmation
         if user_id in delete_account_confirmation:
             delete_account_confirmation.discard(user_id)
-            if text == "✅ Yes, delete":
+            if text == "Yes, delete":
                 await delete_user_completely(user_id)
                 await message.answer(
                     "All your Kind Friends data has been deleted ✅\n\n"
                     "If you send /start again, I will treat you as a completely new user.",
                     reply_markup=ReplyKeyboardMarkup(
-                        keyboard=[[KeyboardButton(text="/start")]], resize_keyboard=True
+                        keyboard=[[KeyboardButton(text="Start")]], resize_keyboard=True
                     ),
                 )
                 return
