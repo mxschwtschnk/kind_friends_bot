@@ -528,15 +528,10 @@ async def admin_handler(message: types.Message):
 async def wipe_me_handler(message: types.Message):
     """
     Completely delete current user from DB.
-    Restricted to ADMIN_ID for testing.
+    Available for any user (self-delete).
     """
-    if message.from_user.id != ADMIN_ID:
-        await message.answer(
-            "This destructive testing command is only available to the creator for now."
-        )
-        return
-
-    await delete_user_completely(message.from_user.id)
+    user_id = message.from_user.id
+    await delete_user_completely(user_id)
     await message.answer(
         "All your Kind Friends data has been deleted ✅\n\n"
         "If you send /start again, I will treat you as a completely new user."
