@@ -1,6 +1,5 @@
-import os
-
 import asyncio
+import os
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -13,6 +12,13 @@ import asyncpg
 # CONFIG
 # -------------------------------------------------------------------
 
+def env_flag(var_name: str, default: bool = False) -> bool:
+    value = os.getenv(var_name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "KindFriendsBot")  # without @
@@ -21,7 +27,7 @@ FEEDBACK_BOT_TOKEN = os.getenv("FEEDBACK_BOT_TOKEN")
 FEEDBACK_RECIPIENT_CHAT_ID = int(os.getenv("FEEDBACK_RECIPIENT_CHAT_ID", "0"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
-USE_POLLING = os.getenv("USE_POLLING", "false").lower() in {"1", "true", "yes"}
+USE_POLLING = env_flag("USE_POLLING", default=False)
 
 if not WEBHOOK_URL and RENDER_EXTERNAL_URL:
     WEBHOOK_URL = RENDER_EXTERNAL_URL.rstrip("/") + "/webhook"
@@ -53,6 +59,8 @@ async def init_db():
     Create connection pool and required tables.
     """
     global pool
+    if pool:
+        return
     pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with pool.acquire() as conn:
@@ -102,6 +110,13 @@ async def init_db():
             );
             """
         )
+
+
+async def close_pool():
+    global pool
+    if pool:
+        await pool.close()
+        pool = None
 
 
 # -------------------------------------------------------------------
@@ -877,7 +892,7 @@ async def generic_handler(message: types.Message):
 
 
 # -------------------------------------------------------------------
-# AIOHTTP APP + WEBHOOK
+# AIOHTTP APP + WEBHOOK / POLLING
 # -------------------------------------------------------------------
 
 async def healthcheck(request):
@@ -887,7 +902,20 @@ async def healthcheck(request):
     return web.Response(text="OK")
 
 
-async def on_startup(app):
+async def shutdown_bots(remove_webhook: bool = False):
+    if remove_webhook:
+        try:
+            await bot.delete_webhook()
+        except Exception as e:
+            print(f"[WARN] Failed to delete webhook: {e}")
+    await bot.session.close()
+    if feedback_bot:
+        await feedback_bot.session.close()
+    await close_pool()
+    print("Kind Friends bot stopped.")
+
+
+async def webhook_startup(app):
     """
     On startup:
     - init DB
@@ -899,53 +927,20 @@ async def on_startup(app):
     print(f"Kind Friends webhook set to {WEBHOOK_URL}")
 
 
-async def shutdown_resources(delete_webhook: bool = False):
-    """
-    Close bot sessions and the database pool.
-    Optionally delete the webhook on exit.
-    """
-    if delete_webhook:
-        await bot.delete_webhook()
-
-    await bot.session.close()
-
-    if feedback_bot:
-        await feedback_bot.session.close()
-
-    if pool:
-        await pool.close()
-
-    print("Kind Friends bot stopped.")
+async def webhook_shutdown(app):
+    await shutdown_bots(remove_webhook=True)
 
 
-async def start_polling():
-    """
-    Optional fallback for environments where webhook hosting is not available.
+async def start_health_server(port: int) -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", healthcheck)
 
-    Deletes any existing webhook (so Telegram stops rejecting getUpdates),
-    starts long polling after the database is ready, and exposes a simple
-    healthcheck server to satisfy platforms (like Render) that expect an open
-    port.
-    """
-    await init_db()
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    health_app = web.Application()
-    health_app.router.add_get("/", healthcheck)
-
-    runner = web.AppRunner(health_app)
+    runner = web.AppRunner(app)
     await runner.setup()
-
-    port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Polling mode enabled; healthcheck server running on port {port}")
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await runner.cleanup()
-        await shutdown_resources()
+    print(f"Healthcheck server running on port {port}")
+    return runner
 
 
 async def start_webhook_server():
@@ -955,39 +950,51 @@ async def start_webhook_server():
     webhook_handler = SimpleRequestHandler(dp, bot)
     webhook_handler.register(app, path="/webhook")
 
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(lambda _: shutdown_resources(delete_webhook=True))
+    app.on_startup.append(webhook_startup)
+    app.on_shutdown.append(webhook_shutdown)
 
     runner = web.AppRunner(app)
     await runner.setup()
-
     port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    print(f"Webhook server starting on port {port}")
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    print(f"Webhook server running on port {port}")
 
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await asyncio.Event().wait()
     finally:
         await runner.cleanup()
 
 
-async def main():
+async def start_polling():
+    await init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    port = int(os.getenv("PORT", 10000))
+    runner = await start_health_server(port)
+    try:
+        print("Starting long polling...")
+        await dp.start_polling(bot)
+    finally:
+        await shutdown_bots()
+        await runner.cleanup()
+
+
+async def async_main():
     if USE_POLLING:
         await start_polling()
         return
 
     try:
         await start_webhook_server()
-    except Exception as exc:  # noqa: BLE001
-        print(f"Webhook server failed ({exc}); falling back to polling...")
+    except Exception as e:
+        print(f"[WARN] Webhook startup failed: {e}")
+        print("Falling back to long polling...")
         await start_polling()
 
 
-def run():
-    asyncio.run(main())
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
-    run()
+    main()
