@@ -238,6 +238,11 @@ async def get_telegram_id_by_username(username: str | None):
     return row["telegram_id"] if row else None
 
 
+def normalize_username_input(raw: str) -> str:
+    """Strip formatting characters users might copy from lists."""
+    return raw.strip().lstrip("-").lstrip("@").strip()
+
+
 async def add_mutual_friendship(a_tg_id: int, b_tg_id: int):
     """
     Make friendship A<->B in both directions.
@@ -1103,7 +1108,7 @@ async def generic_handler(message: types.Message):
         # 1.5) Remove friend mode
         if user_id in remove_friend_mode:
             remove_friend_mode.discard(user_id)
-            friend_username_raw = text.lstrip("@").strip()
+            friend_username_raw = normalize_username_input(text)
             if not friend_username_raw:
                 await message.answer("Please send a valid @username to remove a friend.")
                 return
@@ -1121,7 +1126,10 @@ async def generic_handler(message: types.Message):
 
         # 2) Remove friend: -@username
         if text.startswith("-@"):
-            friend_username_raw = text[2:].strip()
+            friend_username_raw = normalize_username_input(text[2:])
+            if not friend_username_raw:
+                await message.answer("Please send a valid @username to remove a friend.")
+                return
             friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
             if not friend_tg_id:
                 await message.answer("I can't find this friend in Kind Friends.")
