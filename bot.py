@@ -1,10 +1,10 @@
 import os
-import asyncio
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 import asyncpg
 
 # -------------------------------------------------------------------
@@ -17,11 +17,18 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "KindFriendsBot")  # without @
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram ID
 FEEDBACK_BOT_TOKEN = os.getenv("FEEDBACK_BOT_TOKEN")
 FEEDBACK_RECIPIENT_CHAT_ID = int(os.getenv("FEEDBACK_RECIPIENT_CHAT_ID", "0"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+if not WEBHOOK_URL and RENDER_EXTERNAL_URL:
+    WEBHOOK_URL = RENDER_EXTERNAL_URL.rstrip("/") + "/webhook"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
+if not WEBHOOK_URL:
+    raise RuntimeError("WEBHOOK_URL is not set and RENDER_EXTERNAL_URL is missing")
 
 bot = Bot(token=BOT_TOKEN)
 feedback_bot = Bot(token=FEEDBACK_BOT_TOKEN) if FEEDBACK_BOT_TOKEN else None
@@ -777,7 +784,7 @@ async def generic_handler(message: types.Message):
 
 
 # -------------------------------------------------------------------
-# AIOHTTP APP + LONG POLLING
+# AIOHTTP APP + WEBHOOK
 # -------------------------------------------------------------------
 
 async def healthcheck(request):
@@ -791,24 +798,21 @@ async def on_startup(app):
     """
     On startup:
     - init DB
-    - delete webhook (if any)
-    - start long polling in background
+    - set webhook
     """
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
-    app["bot_task"] = asyncio.create_task(dp.start_polling(bot))
-    print("Kind Friends bot polling started.")
+    await bot.set_webhook(WEBHOOK_URL)
+    print(f"Kind Friends webhook set to {WEBHOOK_URL}")
 
 
 async def on_shutdown(app):
     """
     On shutdown:
-    - cancel polling
+    - remove webhook
     - close bot session
     """
-    bot_task = app.get("bot_task")
-    if bot_task:
-        bot_task.cancel()
+    await bot.delete_webhook()
     await bot.session.close()
     if feedback_bot:
         await feedback_bot.session.close()
@@ -818,6 +822,9 @@ async def on_shutdown(app):
 def main():
     app = web.Application()
     app.router.add_get("/", healthcheck)
+
+    webhook_handler = SimpleRequestHandler(dp, bot)
+    webhook_handler.register(app, path="/webhook")
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
