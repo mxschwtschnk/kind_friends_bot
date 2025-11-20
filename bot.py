@@ -5,7 +5,7 @@ import asyncio
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 import asyncpg
 
@@ -42,6 +42,54 @@ add_friend_mode = set()  # user_ids who are adding a friend
 remove_friend_mode = set()  # user_ids who are removing a friend
 feedback_mode = set()  # user_ids who are sending feedback
 delete_account_confirmation = set()  # user_ids awaiting delete confirmation
+
+
+class LoadingIndicator:
+    """
+    Shows a loading hint (typing + temporary keyboard removal) if a handler
+    takes longer than a short delay. Helps users understand the bot is waking
+    up after Render sleeps.
+    """
+
+    def __init__(self, message: types.Message, delay: float = 2.0):
+        self.message = message
+        self.delay = delay
+        self._task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+        self._indicator_message: types.Message | None = None
+
+    async def __aenter__(self):
+        self._task = asyncio.create_task(self._runner())
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._indicator_message:
+            try:
+                await self._indicator_message.delete()
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] Failed to delete loading message: {e}")
+
+    async def _runner(self):
+        try:
+            await asyncio.sleep(self.delay)
+            self._indicator_message = await self.message.answer(
+                "⏳ Просыпаю сервер… подождите пару секунд",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            while not self._stop.is_set():
+                await bot.send_chat_action(self.message.chat.id, "typing")
+                await asyncio.sleep(4)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] Loading indicator error: {e}")
 
 
 # -------------------------------------------------------------------
@@ -702,178 +750,179 @@ async def generic_handler(message: types.Message):
     text = message.text or ""
     user_paused = await is_paused(user_id)
 
-    # 0) Feedback mode
-    if user_id in feedback_mode:
-        feedback_mode.discard(user_id)
-        delete_account_confirmation.discard(user_id)
-        if not feedback_bot or not FEEDBACK_RECIPIENT_CHAT_ID:
-            await message.answer(
-                "I couldn't deliver your feedback because the feedback bot isn't configured yet.",
-                reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
-            )
-            return
+    async with LoadingIndicator(message):
+        # 0) Feedback mode
+        if user_id in feedback_mode:
+            feedback_mode.discard(user_id)
+            delete_account_confirmation.discard(user_id)
+            if not feedback_bot or not FEEDBACK_RECIPIENT_CHAT_ID:
+                await message.answer(
+                    "I couldn't deliver your feedback because the feedback bot isn't configured yet.",
+                    reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+                )
+                return
 
-        try:
-            await feedback_bot.send_message(
-                FEEDBACK_RECIPIENT_CHAT_ID,
-                f"Feedback from @{message.from_user.username or 'user'} (ID: {user_id}):\n\n{text}",
-            )
-        except Exception:
-            await message.answer(
-                "Something went wrong and I couldn't send your feedback. Please try again later.",
-                reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
-            )
-            return
-
-        await message.answer(
-            "Thanks! I delivered your feedback to the admin.",
-            reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
-        )
-        return
-
-    # 0.1) Delete confirmation
-    if user_id in delete_account_confirmation:
-        delete_account_confirmation.discard(user_id)
-        if text == "✅ Yes, delete":
-            await delete_user_completely(user_id)
-            await message.answer(
-                "All your Kind Friends data has been deleted ✅\n\n"
-                "If you send /start again, I will treat you as a completely new user.",
-                reply_markup=ReplyKeyboardMarkup(
-                    keyboard=[[KeyboardButton(text="/start")]], resize_keyboard=True
-                ),
-            )
-            return
-        else:
-            await message.answer(
-                "I kept your account. You can continue using Kind Friends.",
-                reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
-            )
-            return
-
-    # 1) Add friend mode
-    if user_id in add_friend_mode and text.startswith("@"):
-        add_friend_mode.discard(user_id)
-        friend_username_raw = text.strip()
-
-        friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-        clean_username = friend_username_raw.lstrip("@")
-
-        if not friend_tg_id:
-            invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
-            await message.answer(
-                "I can't find this user in **Kind Friends** yet.\n\n"
-                "Send them this invite link and ask them to press Start:\n"
-                f"{invite_link}"
-            )
-            return
-
-        if friend_tg_id == user_id:
-            await message.answer("You cannot add yourself 🙂")
-            return
-
-        await add_mutual_friendship(user_id, friend_tg_id)
-
-        # Notify friend (best-effort)
-        try:
-            await bot.send_message(
-                friend_tg_id,
-                f"@{message.from_user.username} added you as a friend on **Kind Friends** 🎉",
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            print(f"[WARN] Failed to notify friend {friend_tg_id}: {e}")
-
-        await message.answer(
-            f"You are now connected with @{clean_username}. "
-            "You can share links with each other."
-        )
-        return
-
-    # 1.5) Remove friend mode
-    if user_id in remove_friend_mode:
-        remove_friend_mode.discard(user_id)
-        friend_username_raw = text.lstrip("@").strip()
-        if not friend_username_raw:
-            await message.answer("Please send a valid @username to remove a friend.")
-            return
-
-        friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-        if not friend_tg_id:
-            await message.answer("I can't find this friend in Kind Friends.")
-            return
-
-        await remove_friendship(user_id, friend_tg_id)
-        await message.answer(
-            f"You are no longer connected with @{friend_username_raw} on Kind Friends."
-        )
-        return
-
-    # 2) Remove friend: -@username
-    if text.startswith("-@"):
-        friend_username_raw = text[2:].strip()
-        friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-        if not friend_tg_id:
-            await message.answer("I can't find this friend in Kind Friends.")
-            return
-
-        await remove_friendship(user_id, friend_tg_id)
-        await message.answer(
-            f"You are no longer connected with {friend_username_raw} on Kind Friends."
-        )
-        return
-
-    # 3) Link sending
-    if text.startswith("http://") or text.startswith("https://"):
-        paused = user_paused
-        if paused:
-            await message.answer(
-                "You are currently on pause.\n"
-                "Tap ▶️ Resume if you want to send and receive links again."
-            )
-            return
-
-        friends_ids = await get_all_friend_ids(user_id)
-        sender_username = message.from_user.username or "your friend"
-        sent_count = 0
-        stored_count = 0
-
-        for fid in friends_ids:
             try:
-                if await is_paused(fid):
-                    await save_pending_link(fid, user_id, text)
-                    stored_count += 1
-                else:
-                    await bot.send_message(
-                        fid,
-                        f"@{sender_username} shared a link with you:\n{text}",
-                    )
-                    sent_count += 1
-            except Exception as e:
-                print(f"[WARN] Failed to deliver link to {fid}: {e}")
+                await feedback_bot.send_message(
+                    FEEDBACK_RECIPIENT_CHAT_ID,
+                    f"Feedback from @{message.from_user.username or 'user'} (ID: {user_id}):\n\n{text}",
+                )
+            except Exception:
+                await message.answer(
+                    "Something went wrong and I couldn't send your feedback. Please try again later.",
+                    reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+                )
+                return
 
-        # increment personal counter
-        await increment_sent_links(user_id)
-
-        if sent_count == 0 and stored_count == 0:
             await message.answer(
-                "Got your link ✅\n"
-                "Right now you don't have any friends to send it to."
+                "Thanks! I delivered your feedback to the admin.",
+                reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
             )
-        else:
-            parts = ["Got your link ✅"]
-            if sent_count:
-                parts.append(f"Sent to {sent_count} active friend(s).")
-            if stored_count:
-                parts.append(f"Saved for {stored_count} friend(s) who are on pause.")
-            await message.answer("\n".join(parts))
-        return
+            return
 
-    # 4) Fallback
-    await message.answer(
-        "Use the buttons to open Friends or Help, or paste a link to share it with friends.",
-        reply_markup=main_keyboard(user_paused),
-    )
+        # 0.1) Delete confirmation
+        if user_id in delete_account_confirmation:
+            delete_account_confirmation.discard(user_id)
+            if text == "✅ Yes, delete":
+                await delete_user_completely(user_id)
+                await message.answer(
+                    "All your Kind Friends data has been deleted ✅\n\n"
+                    "If you send /start again, I will treat you as a completely new user.",
+                    reply_markup=ReplyKeyboardMarkup(
+                        keyboard=[[KeyboardButton(text="/start")]], resize_keyboard=True
+                    ),
+                )
+                return
+            else:
+                await message.answer(
+                    "I kept your account. You can continue using Kind Friends.",
+                    reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+                )
+                return
+
+        # 1) Add friend mode
+        if user_id in add_friend_mode and text.startswith("@"):
+            add_friend_mode.discard(user_id)
+            friend_username_raw = text.strip()
+
+            friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+            clean_username = friend_username_raw.lstrip("@")
+
+            if not friend_tg_id:
+                invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
+                await message.answer(
+                    "I can't find this user in **Kind Friends** yet.\n\n"
+                    "Send them this invite link and ask them to press Start:\n"
+                    f"{invite_link}"
+                )
+                return
+
+            if friend_tg_id == user_id:
+                await message.answer("You cannot add yourself 🙂")
+                return
+
+            await add_mutual_friendship(user_id, friend_tg_id)
+
+            # Notify friend (best-effort)
+            try:
+                await bot.send_message(
+                    friend_tg_id,
+                    f"@{message.from_user.username} added you as a friend on **Kind Friends** 🎉",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                print(f"[WARN] Failed to notify friend {friend_tg_id}: {e}")
+
+            await message.answer(
+                f"You are now connected with @{clean_username}. "
+                "You can share links with each other."
+            )
+            return
+
+        # 1.5) Remove friend mode
+        if user_id in remove_friend_mode:
+            remove_friend_mode.discard(user_id)
+            friend_username_raw = text.lstrip("@").strip()
+            if not friend_username_raw:
+                await message.answer("Please send a valid @username to remove a friend.")
+                return
+
+            friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+            if not friend_tg_id:
+                await message.answer("I can't find this friend in Kind Friends.")
+                return
+
+            await remove_friendship(user_id, friend_tg_id)
+            await message.answer(
+                f"You are no longer connected with @{friend_username_raw} on Kind Friends."
+            )
+            return
+
+        # 2) Remove friend: -@username
+        if text.startswith("-@"):
+            friend_username_raw = text[2:].strip()
+            friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+            if not friend_tg_id:
+                await message.answer("I can't find this friend in Kind Friends.")
+                return
+
+            await remove_friendship(user_id, friend_tg_id)
+            await message.answer(
+                f"You are no longer connected with {friend_username_raw} on Kind Friends."
+            )
+            return
+
+        # 3) Link sending
+        if text.startswith("http://") or text.startswith("https://"):
+            paused = user_paused
+            if paused:
+                await message.answer(
+                    "You are currently on pause.\n"
+                    "Tap ▶️ Resume if you want to send and receive links again."
+                )
+                return
+
+            friends_ids = await get_all_friend_ids(user_id)
+            sender_username = message.from_user.username or "your friend"
+            sent_count = 0
+            stored_count = 0
+
+            for fid in friends_ids:
+                try:
+                    if await is_paused(fid):
+                        await save_pending_link(fid, user_id, text)
+                        stored_count += 1
+                    else:
+                        await bot.send_message(
+                            fid,
+                            f"@{sender_username} shared a link with you:\n{text}",
+                        )
+                        sent_count += 1
+                except Exception as e:
+                    print(f"[WARN] Failed to deliver link to {fid}: {e}")
+
+            # increment personal counter
+            await increment_sent_links(user_id)
+
+            if sent_count == 0 and stored_count == 0:
+                await message.answer(
+                    "Got your link ✅\n"
+                    "Right now you don't have any friends to send it to."
+                )
+            else:
+                parts = ["Got your link ✅"]
+                if sent_count:
+                    parts.append(f"Sent to {sent_count} active friend(s).")
+                if stored_count:
+                    parts.append(f"Saved for {stored_count} friend(s) who are on pause.")
+                await message.answer("\n".join(parts))
+            return
+
+        # 4) Fallback
+        await message.answer(
+            "Use the buttons to open Friends or Help, or paste a link to share it with friends.",
+            reply_markup=main_keyboard(user_paused),
+        )
 
 
 # -------------------------------------------------------------------
