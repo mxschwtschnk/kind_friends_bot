@@ -5,7 +5,13 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 import asyncpg
 
 # -------------------------------------------------------------------
@@ -73,7 +79,7 @@ class LoadingIndicator:
         try:
             await asyncio.sleep(self.delay)
             self._indicator_message = await self.message.answer(
-                "⏳ Просыпаю сервер… подождите пару секунд",
+                "⏳ Waking up the server… please wait a couple seconds",
                 reply_markup=ReplyKeyboardRemove(),
             )
             while not self._stop.is_set():
@@ -127,6 +133,19 @@ async def init_db():
                 friend_telegram_id BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE (user_telegram_id, friend_telegram_id)
+            );
+            """
+        )
+
+        # Friend requests awaiting confirmation
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_friend_requests (
+                id SERIAL PRIMARY KEY,
+                requester_telegram_id BIGINT NOT NULL,
+                recipient_telegram_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (requester_telegram_id, recipient_telegram_id)
             );
             """
         )
@@ -294,6 +313,83 @@ async def remove_friendship(a_tg_id: int, b_tg_id: int):
         )
 
 
+async def get_username_by_telegram_id(tg_id: int) -> str | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT username FROM users WHERE telegram_id=$1;",
+            tg_id,
+        )
+    return row["username"] if row else None
+
+
+async def get_pending_friend_request(
+    requester_id: int, recipient_id: int
+) -> asyncpg.Record | None:
+    """
+    Fetch a pending friend request from requester to recipient, if any.
+    """
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT id, requester_telegram_id, recipient_telegram_id
+            FROM pending_friend_requests
+            WHERE requester_telegram_id=$1 AND recipient_telegram_id=$2;
+            """,
+            requester_id,
+            recipient_id,
+        )
+
+
+async def create_friend_request(requester_id: int, recipient_id: int) -> int | None:
+    """
+    Create a pending friend request. Returns its ID, or None on failure.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO pending_friend_requests (requester_telegram_id, recipient_telegram_id)
+            VALUES ($1, $2)
+            ON CONFLICT (requester_telegram_id, recipient_telegram_id) DO NOTHING
+            RETURNING id;
+            """,
+            requester_id,
+            recipient_id,
+        )
+    return row["id"] if row else None
+
+
+async def get_friend_request_by_id(request_id: int) -> asyncpg.Record | None:
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT id, requester_telegram_id, recipient_telegram_id
+            FROM pending_friend_requests
+            WHERE id=$1;
+            """,
+            request_id,
+        )
+
+
+async def delete_friend_request(request_id: int):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM pending_friend_requests WHERE id=$1;",
+            request_id,
+        )
+
+
+async def delete_friend_requests_for_user(tg_id: int):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            DELETE FROM pending_friend_requests
+            WHERE requester_telegram_id = $1
+               OR recipient_telegram_id = $1;
+            """,
+            tg_id,
+        )
+
+
 async def save_pending_link(recipient_id: int, sender_id: int, url: str):
     """
     Store a link for a recipient who is on pause.
@@ -372,6 +468,16 @@ async def delete_user_completely(tg_id: int):
             tg_id,
         )
 
+        # Remove pending friend requests
+        await conn.execute(
+            """
+            DELETE FROM pending_friend_requests
+            WHERE requester_telegram_id = $1
+               OR recipient_telegram_id = $1;
+            """,
+            tg_id,
+        )
+
         # Remove pending links sent or received by this user
         await conn.execute(
             """
@@ -392,6 +498,10 @@ async def delete_user_completely(tg_id: int):
 # -------------------------------------------------------------------
 # UI
 # -------------------------------------------------------------------
+
+
+def display_username(username: str | None, fallback: str = "friend") -> str:
+    return f"@{username}" if username else fallback
 
 def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
     if paused:
@@ -712,6 +822,80 @@ async def remove_friend_handler(message: types.Message):
     )
 
 
+@dp.callback_query(F.data.startswith("friend_accept:"))
+async def accept_friend_request(callback: types.CallbackQuery):
+    try:
+        request_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid request.", show_alert=True)
+        return
+
+    request = await get_friend_request_by_id(request_id)
+    if not request:
+        await callback.answer("This request has already been handled.", show_alert=True)
+        return
+
+    if request["recipient_telegram_id"] != callback.from_user.id:
+        await callback.answer("This request is for a different user.", show_alert=True)
+        return
+
+    await delete_friend_request(request_id)
+    await add_mutual_friendship(request["requester_telegram_id"], request["recipient_telegram_id"])
+
+    requester_username = await get_username_by_telegram_id(request["requester_telegram_id"])
+    recipient_username = await get_username_by_telegram_id(callback.from_user.id)
+    requester_display = display_username(requester_username, "friend")
+    recipient_display = display_username(recipient_username, "friend")
+
+    await callback.message.answer(
+        f"You confirmed the friend request from {requester_display}. You're now friends."
+    )
+
+    try:
+        await bot.send_message(
+            request["requester_telegram_id"],
+            f"{recipient_display} accepted your invitation. You're now friends!",
+        )
+    except Exception as e:
+        print(f"[WARN] Failed to notify requester {request['requester_telegram_id']}: {e}")
+
+    await callback.answer("Friendship confirmed!")
+
+
+@dp.callback_query(F.data.startswith("friend_decline:"))
+async def decline_friend_request(callback: types.CallbackQuery):
+    try:
+        request_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid request.", show_alert=True)
+        return
+
+    request = await get_friend_request_by_id(request_id)
+    if not request:
+        await callback.answer("This request has already been handled.", show_alert=True)
+        return
+
+    if request["recipient_telegram_id"] != callback.from_user.id:
+        await callback.answer("This request is for a different user.", show_alert=True)
+        return
+
+    await delete_friend_request(request_id)
+
+    decliner_display = display_username(callback.from_user.username, "user")
+
+    await callback.message.answer("You declined the friend invitation.")
+
+    try:
+        await bot.send_message(
+            request["requester_telegram_id"],
+            f"{decliner_display} declined your invitation. You can send another request later.",
+        )
+    except Exception as e:
+        print(f"[WARN] Failed to notify requester {request['requester_telegram_id']}: {e}")
+
+    await callback.answer("Request declined.")
+
+
 @dp.callback_query(F.data == "start_feedback")
 async def start_feedback(callback: types.CallbackQuery):
     feedback_mode.add(callback.from_user.id)
@@ -841,22 +1025,79 @@ async def generic_handler(message: types.Message):
                 await message.answer("You cannot add yourself 🙂")
                 return
 
-            await add_mutual_friendship(user_id, friend_tg_id)
+            existing_friends = await get_all_friend_ids(user_id)
+            if friend_tg_id in existing_friends:
+                await message.answer(
+                    f"You are already connected with @{clean_username} in Kind Friends."
+                )
+                return
 
-            # Notify friend (best-effort)
+            outgoing_request = await get_pending_friend_request(user_id, friend_tg_id)
+            if outgoing_request:
+                await message.answer(
+                    "You already sent an invitation. Please wait for your friend to respond."
+                )
+                return
+
+            incoming_request = await get_pending_friend_request(friend_tg_id, user_id)
+            if incoming_request:
+                await delete_friend_request(incoming_request["id"])
+                await add_mutual_friendship(user_id, friend_tg_id)
+
+                friend_username = await get_username_by_telegram_id(friend_tg_id)
+                friend_display = display_username(friend_username or clean_username, "friend")
+                user_display = display_username(message.from_user.username, "friend")
+
+                await message.answer(
+                    f"You confirmed the request from {friend_display}. You're now friends."
+                )
+                try:
+                    await bot.send_message(
+                        friend_tg_id,
+                        f"{user_display} accepted your request. You're now friends!",
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed to notify friend {friend_tg_id}: {e}")
+                return
+
+            request_id = await create_friend_request(user_id, friend_tg_id)
+            if not request_id:
+                await message.answer(
+                    "I couldn't send the request right now. Please try again in a bit."
+                )
+                return
+
+            friend_username = await get_username_by_telegram_id(friend_tg_id)
+            friend_display = display_username(friend_username or clean_username, "friend")
+            await message.answer(
+                f"Request sent to {friend_display}. Waiting for confirmation."
+            )
+
+            requester_display = display_username(message.from_user.username, "User")
+            confirmation_keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Accept",
+                            callback_data=f"friend_accept:{request_id}",
+                        ),
+                        InlineKeyboardButton(
+                            text="❌ Decline",
+                            callback_data=f"friend_decline:{request_id}",
+                        ),
+                    ]
+                ]
+            )
+
             try:
                 await bot.send_message(
                     friend_tg_id,
-                    f"@{message.from_user.username} added you as a friend on **Kind Friends** 🎉",
-                    parse_mode="Markdown",
+                    f"{requester_display} wants to add you as a friend on Kind Friends.\n\n"
+                    "Ready to confirm?",
+                    reply_markup=confirmation_keyboard,
                 )
             except Exception as e:
-                print(f"[WARN] Failed to notify friend {friend_tg_id}: {e}")
-
-            await message.answer(
-                f"You are now connected with @{clean_username}. "
-                "You can share links with each other."
-            )
+                print(f"[WARN] Failed to deliver friend confirmation to {friend_tg_id}: {e}")
             return
 
         # 1.5) Remove friend mode
