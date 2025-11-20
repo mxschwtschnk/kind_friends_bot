@@ -409,8 +409,7 @@ def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
 def friends_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Invite")],
-            [KeyboardButton(text="➖ Remove")],
+            [KeyboardButton(text="➕ Invite"), KeyboardButton(text="➖ Remove")],
             [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
