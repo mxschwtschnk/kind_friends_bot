@@ -22,23 +22,24 @@ if not DATABASE_URL:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Global DB pool and simple in-memory state
 pool: asyncpg.Pool | None = None
 add_friend_mode = set()  # user_ids who are adding a friend
 
 
 # -------------------------------------------------------------------
-# DATABASE
+# DATABASE SETUP
 # -------------------------------------------------------------------
 
 async def init_db():
     """
-    Create pool and tables if they do not exist.
+    Create connection pool and required tables.
     """
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with pool.acquire() as conn:
-        # users
+        # Users table
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -50,7 +51,8 @@ async def init_db():
             );
             """
         )
-        # friendships
+
+        # Friendships table
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS friendships (
@@ -63,10 +65,28 @@ async def init_db():
             """
         )
 
+        # Pending links for paused users
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_links (
+                id SERIAL PRIMARY KEY,
+                recipient_telegram_id BIGINT NOT NULL,
+                sender_telegram_id BIGINT NOT NULL,
+                url TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+
+
+# -------------------------------------------------------------------
+# DATABASE HELPERS
+# -------------------------------------------------------------------
 
 async def get_or_create_user(tg_id: int, username: str | None) -> bool:
     """
-    Returns is_paused flag; creates user if not exists.
+    Make sure user exists; always keep username fresh.
+    Return current is_paused flag.
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -119,6 +139,9 @@ async def is_paused(tg_id: int) -> bool:
 
 
 async def get_telegram_id_by_username(username: str | None):
+    """
+    Find telegram_id by @username (case-insensitive).
+    """
     if not username:
         return None
     username = username.lstrip("@").strip().lower()
@@ -131,6 +154,9 @@ async def get_telegram_id_by_username(username: str | None):
 
 
 async def add_mutual_friendship(a_tg_id: int, b_tg_id: int):
+    """
+    Make friendship A<->B in both directions.
+    """
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -153,6 +179,9 @@ async def add_mutual_friendship(a_tg_id: int, b_tg_id: int):
 
 
 async def get_friend_usernames(tg_id: int):
+    """
+    Return list of friends' usernames for display.
+    """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -167,22 +196,26 @@ async def get_friend_usernames(tg_id: int):
     return [r["username"] for r in rows if r["username"]]
 
 
-async def get_active_friend_ids(tg_id: int):
+async def get_all_friend_ids(tg_id: int):
+    """
+    Get telegram_ids of all friends (paused or not).
+    """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT u.telegram_id
-            FROM friendships f
-            JOIN users u ON u.telegram_id = f.friend_telegram_id
-            WHERE f.user_telegram_id = $1
-              AND u.is_paused = FALSE;
+            SELECT friend_telegram_id
+            FROM friendships
+            WHERE user_telegram_id = $1;
             """,
             tg_id,
         )
-    return [r["telegram_id"] for r in rows]
+    return [r["friend_telegram_id"] for r in rows]
 
 
 async def remove_friendship(a_tg_id: int, b_tg_id: int):
+    """
+    Remove friendship A-B and B-A.
+    """
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -192,6 +225,51 @@ async def remove_friendship(a_tg_id: int, b_tg_id: int):
             """,
             a_tg_id,
             b_tg_id,
+        )
+
+
+async def save_pending_link(recipient_id: int, sender_id: int, url: str):
+    """
+    Store a link for a recipient who is on pause.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO pending_links (recipient_telegram_id, sender_telegram_id, url)
+            VALUES ($1, $2, $3);
+            """,
+            recipient_id,
+            sender_id,
+            url,
+        )
+
+
+async def get_pending_links_for_user(recipient_id: int):
+    """
+    Get all pending links for a recipient with sender usernames.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.url, p.created_at, u.username AS sender_username
+            FROM pending_links p
+            JOIN users u ON u.telegram_id = p.sender_telegram_id
+            WHERE p.recipient_telegram_id = $1
+            ORDER BY p.created_at;
+            """,
+            recipient_id,
+        )
+    return rows
+
+
+async def clear_pending_links_for_user(recipient_id: int):
+    """
+    Delete all pending links for a recipient after digest is sent.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM pending_links WHERE recipient_telegram_id=$1",
+            recipient_id,
         )
 
 
@@ -218,6 +296,9 @@ def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+    """
+    /start: ensure user exists and show main menu.
+    """
     paused = await get_or_create_user(
         message.from_user.id,
         message.from_user.username,
@@ -251,6 +332,9 @@ async def help_handler(message: types.Message):
 
 @dp.message(F.text == "⏸ Pause")
 async def pause_handler(message: types.Message):
+    """
+    Enable pause mode.
+    """
     user_id = message.from_user.id
     await set_pause(user_id, True)
     await message.answer(
@@ -265,13 +349,50 @@ async def pause_handler(message: types.Message):
 
 @dp.message(F.text == "▶️ Resume")
 async def resume_handler(message: types.Message):
+    """
+    Disable pause mode and send digest of missed links.
+    """
     user_id = message.from_user.id
     await set_pause(user_id, False)
+
+    rows = await get_pending_links_for_user(user_id)
+
+    if not rows:
+        await message.answer(
+            "Welcome back! 👋\n"
+            "You are active again.\n"
+            "You did not miss any links while you were on pause.",
+            reply_markup=main_keyboard(False),
+        )
+        return
+
+    # Group links by date
+    from collections import defaultdict
+
+    grouped = defaultdict(list)
+    for r in rows:
+        dt = r["created_at"]
+        date_key = dt.date().isoformat()
+        sender_username = r["sender_username"] or "your friend"
+        url = r["url"]
+        grouped[date_key].append(f"@{sender_username} — {url}")
+
+    parts = []
+    for date_key in sorted(grouped.keys()):
+        parts.append(f"📅 {date_key}")
+        parts.extend(grouped[date_key])
+        parts.append("")  # empty line between days
+
+    digest_text = "Here is what you missed while you were on pause:\n\n" + "\n".join(parts)
+
+    # Clear inbox after sending digest
+    await clear_pending_links_for_user(user_id)
+
     await message.answer(
-        "Welcome back! 👋\n"
-        "You are active again.",
+        "Welcome back! 👋\nYou are active again.",
         reply_markup=main_keyboard(False),
     )
+    await message.answer(digest_text)
 
 
 @dp.message(F.text == "➕ Invite friends")
@@ -316,6 +437,13 @@ async def feedback_handler(message: types.Message):
 
 @dp.message()
 async def generic_handler(message: types.Message):
+    """
+    Generic handler:
+    - add friend by @username
+    - remove friend via -@username
+    - send links to friends or store for paused friends
+    - fallback text
+    """
     user_id = message.from_user.id
     text = message.text or ""
 
@@ -357,6 +485,7 @@ async def generic_handler(message: types.Message):
 
     # 3) Link sending
     if text.startswith("http://") or text.startswith("https://"):
+        # If sender is paused — do not send
         paused = await is_paused(user_id)
         if paused:
             await message.answer(
@@ -365,30 +494,39 @@ async def generic_handler(message: types.Message):
             )
             return
 
-        friends_ids = await get_active_friend_ids(user_id)
+        friends_ids = await get_all_friend_ids(user_id)
         sender_username = message.from_user.username or "your friend"
         sent_count = 0
+        stored_count = 0
 
         for fid in friends_ids:
             try:
-                await bot.send_message(
-                    fid,
-                    f"@{sender_username} shared a link with you:\n{text}",
-                )
-                sent_count += 1
+                if await is_paused(fid):
+                    # friend is paused → store link
+                    await save_pending_link(fid, user_id, text)
+                    stored_count += 1
+                else:
+                    # friend is active → send now
+                    await bot.send_message(
+                        fid,
+                        f"@{sender_username} shared a link with you:\n{text}",
+                    )
+                    sent_count += 1
             except Exception as e:
-                print(f"[WARN] Failed to send link to {fid}: {e}")
+                print(f"[WARN] Failed to deliver link to {fid}: {e}")
 
-        if sent_count == 0:
+        if sent_count == 0 and stored_count == 0:
             await message.answer(
                 "Got your link ✅\n"
-                "Right now you don't have any active friends to send it to."
+                "Right now you don't have any friends to send it to."
             )
         else:
-            await message.answer(
-                f"Got your link ✅\n"
-                f"I sent it to {sent_count} friend(s)."
-            )
+            parts = ["Got your link ✅"]
+            if sent_count:
+                parts.append(f"Sent to {sent_count} active friend(s).")
+            if stored_count:
+                parts.append(f"Saved for {stored_count} friend(s) who are on pause.")
+            await message.answer("\n".join(parts))
         return
 
     # 4) Fallback
@@ -405,7 +543,7 @@ async def generic_handler(message: types.Message):
 
 async def healthcheck(request):
     """
-    Simple healthcheck endpoint so Render sees an open port.
+    Simple endpoint so Render sees an open port.
     """
     return web.Response(text="OK")
 
@@ -414,11 +552,10 @@ async def on_startup(app):
     """
     On startup:
     - init DB
-    - delete webhook (in case it was set)
-    - start aiogram long polling in background
+    - delete webhook (if any)
+    - start long polling in background
     """
     await init_db()
-    # Ensure webhook is disabled (we use getUpdates long polling)
     await bot.delete_webhook(drop_pending_updates=True)
     app["bot_task"] = asyncio.create_task(dp.start_polling(bot))
     print("Kind Friends bot polling started.")
@@ -427,7 +564,7 @@ async def on_startup(app):
 async def on_shutdown(app):
     """
     On shutdown:
-    - cancel polling task
+    - cancel polling
     - close bot session
     """
     bot_task = app.get("bot_task")
