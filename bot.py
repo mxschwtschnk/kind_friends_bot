@@ -1,5 +1,7 @@
 import os
 
+import asyncio
+
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -19,6 +21,7 @@ FEEDBACK_BOT_TOKEN = os.getenv("FEEDBACK_BOT_TOKEN")
 FEEDBACK_RECIPIENT_CHAT_ID = int(os.getenv("FEEDBACK_RECIPIENT_CHAT_ID", "0"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+USE_POLLING = os.getenv("USE_POLLING", "false").lower() in {"1", "true", "yes"}
 
 if not WEBHOOK_URL and RENDER_EXTERNAL_URL:
     WEBHOOK_URL = RENDER_EXTERNAL_URL.rstrip("/") + "/webhook"
@@ -27,7 +30,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
-if not WEBHOOK_URL:
+if not WEBHOOK_URL and not USE_POLLING:
     raise RuntimeError("WEBHOOK_URL is not set and RENDER_EXTERNAL_URL is missing")
 
 bot = Bot(token=BOT_TOKEN)
@@ -896,20 +899,56 @@ async def on_startup(app):
     print(f"Kind Friends webhook set to {WEBHOOK_URL}")
 
 
-async def on_shutdown(app):
+async def shutdown_resources(delete_webhook: bool = False):
     """
-    On shutdown:
-    - remove webhook
-    - close bot session
+    Close bot sessions and the database pool.
+    Optionally delete the webhook on exit.
     """
-    await bot.delete_webhook()
+    if delete_webhook:
+        await bot.delete_webhook()
+
     await bot.session.close()
+
     if feedback_bot:
         await feedback_bot.session.close()
+
+    if pool:
+        await pool.close()
+
     print("Kind Friends bot stopped.")
 
 
-def main():
+async def start_polling():
+    """
+    Optional fallback for environments where webhook hosting is not available.
+
+    Deletes any existing webhook (so Telegram stops rejecting getUpdates),
+    starts long polling after the database is ready, and exposes a simple
+    healthcheck server to satisfy platforms (like Render) that expect an open
+    port.
+    """
+    await init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    health_app = web.Application()
+    health_app.router.add_get("/", healthcheck)
+
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    print(f"Polling mode enabled; healthcheck server running on port {port}")
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+        await shutdown_resources()
+
+
+async def start_webhook_server():
     app = web.Application()
     app.router.add_get("/", healthcheck)
 
@@ -917,11 +956,38 @@ def main():
     webhook_handler.register(app, path="/webhook")
 
     app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
+    app.on_shutdown.append(lambda _: shutdown_resources(delete_webhook=True))
+
+    runner = web.AppRunner(app)
+    await runner.setup()
 
     port = int(os.getenv("PORT", 10000))
-    web.run_app(app, host="0.0.0.0", port=port)
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    print(f"Webhook server starting on port {port}")
+    await site.start()
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await runner.cleanup()
+
+
+async def main():
+    if USE_POLLING:
+        await start_polling()
+        return
+
+    try:
+        await start_webhook_server()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Webhook server failed ({exc}); falling back to polling...")
+        await start_polling()
+
+
+def run():
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
-    main()
+    run()
