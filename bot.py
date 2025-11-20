@@ -3,7 +3,7 @@ import os
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 import asyncpg
 
@@ -38,6 +38,7 @@ pool: asyncpg.Pool | None = None
 add_friend_mode = set()  # user_ids who are adding a friend
 remove_friend_mode = set()  # user_ids who are removing a friend
 feedback_mode = set()  # user_ids who are sending feedback
+delete_account_confirmation = set()  # user_ids awaiting delete confirmation
 
 
 # -------------------------------------------------------------------
@@ -349,13 +350,39 @@ async def delete_user_completely(tg_id: int):
 # -------------------------------------------------------------------
 
 def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
-    pause_button = "▶️ Resume" if paused else "⏸ Pause"
+    if paused:
+        keyboard = [
+            [KeyboardButton(text="▶️ Resume")],
+            [KeyboardButton(text="ℹ️ Help")],
+        ]
+    else:
+        keyboard = [
+            [KeyboardButton(text="👥 Friends")],
+            [KeyboardButton(text="⏸ Pause")],
+            [KeyboardButton(text="ℹ️ Help")],
+        ]
+
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+def friends_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Invite friends"), KeyboardButton(text="👥 Friends")],
-            [KeyboardButton(text="➖ Remove friend")],
-            [KeyboardButton(text=pause_button)],
-            [KeyboardButton(text="ℹ️ Help")],
+            [KeyboardButton(text="➕ Invite")],
+            [KeyboardButton(text="➖ Remove")],
+            [KeyboardButton(text="⬅️ Back")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def help_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📖 How to")],
+            [KeyboardButton(text="🗑 Delete Account")],
+            [KeyboardButton(text="💬 Feedback")],
+            [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
     )
@@ -422,9 +449,8 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "Hi! I’m **Kind Friends** 👋\n\n"
         "I help friends share important links with each other.\n\n"
-        "• Paste a link here – I will treat it as something you want to share.\n"
-        "• Use the buttons below to invite friends, see your list,\n"
-        "  manage friends, or pause/resume.\n"
+        "Paste a link here – I will treat it as something you want to share.\n"
+        "• Use the buttons to open Friends, pause/resume, or read help.\n"
         + invite_note,
         reply_markup=main_keyboard(paused),
     )
@@ -432,23 +458,57 @@ async def cmd_start(message: types.Message):
 
 @dp.message(F.text == "ℹ️ Help")
 async def help_handler(message: types.Message):
-    text = (
-        "I’m **Kind Friends** 👋\n\n"
-        "What I do:\n"
-        "• Let your friends send you important links (posts, events, articles, etc.)\n"
-        "• Let you send your important links to your friends\n\n"
-        "The idea is mutual support: when you get a link, you open it and, if possible,\n"
-        "support your friend (like, comment, share, sign up, etc.).\n\n"
-        "How to use me:\n"
-        "• Just paste a link directly into this chat — that’s enough.\n"
-        "• Use the buttons to invite friends, manage your list, or pause/resume.\n\n"
-        "Want to share feedback or ideas? Tap the button below.",
-    )
     await message.answer(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="💡 Send feedback", callback_data="start_feedback")]]
+        "Pick a help option:",
+        reply_markup=help_keyboard(),
+    )
+
+
+@dp.message(F.text == "📖 How to")
+async def how_to_handler(message: types.Message):
+    await message.answer(
+        "Paste any link here to share it with all your connected friends.\n"
+        "Use Friends to add/remove people, and Pause to stop sending/receiving until you resume.",
+        reply_markup=help_keyboard(),
+    )
+
+
+@dp.message(F.text == "🗑 Delete Account")
+async def delete_account_prompt(message: types.Message):
+    user_id = message.from_user.id
+    delete_account_confirmation.add(user_id)
+    await message.answer(
+        "Are you sure you want to delete your Kind Friends account?\n\n"
+        "This will remove all friends, delete any stored pending links, and new links will no longer arrive.\n"
+        "Continue?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="✅ Yes, delete"), KeyboardButton(text="❌ No, keep my account")],
+            ],
+            resize_keyboard=True,
         ),
+    )
+
+
+@dp.message(F.text == "💬 Feedback")
+async def start_feedback_from_menu(message: types.Message):
+    feedback_mode.add(message.from_user.id)
+    await message.answer(
+        "Thanks for willing to share feedback!\nSend your thoughts in one message and I'll pass it along.",
+        reply_markup=help_keyboard(),
+    )
+
+
+@dp.message(F.text == "⬅️ Back")
+async def back_to_main(message: types.Message):
+    user_paused = await is_paused(message.from_user.id)
+    add_friend_mode.discard(message.from_user.id)
+    remove_friend_mode.discard(message.from_user.id)
+    feedback_mode.discard(message.from_user.id)
+    delete_account_confirmation.discard(message.from_user.id)
+    await message.answer(
+        "Back to the main menu.",
+        reply_markup=main_keyboard(user_paused),
     )
 
 
@@ -515,7 +575,7 @@ async def resume_handler(message: types.Message):
     await message.answer(digest_text)
 
 
-@dp.message(F.text == "➕ Invite friends")
+@dp.message(F.text == "➕ Invite")
 async def invite_friends_handler(message: types.Message):
     user_id = message.from_user.id
     add_friend_mode.add(user_id)
@@ -529,24 +589,28 @@ async def invite_friends_handler(message: types.Message):
 @dp.message(F.text == "👥 Friends")
 async def friends_handler(message: types.Message):
     user_id = message.from_user.id
-    friends = await get_friend_usernames(user_id)
-
-    if not friends:
+    if await is_paused(user_id):
         await message.answer(
-            "You don't have any friends connected yet.\n"
-            "Tap “➕ Invite friends” to add someone."
+            "You are currently on pause. Tap ▶️ Resume to manage friends again.",
+            reply_markup=main_keyboard(True),
         )
         return
 
-    lines = [f"- @{u}" for u in friends]
-    text = (
-        "Your friends:\n" + "\n".join(lines) +
-        "\n\nTo remove someone, tap “➖ Remove friend” and choose who to disconnect."
-    )
-    await message.answer(text, parse_mode="Markdown")
+    friends = await get_friend_usernames(user_id)
+
+    if friends:
+        lines = [f"- @{u}" for u in friends]
+        text = "Your friends:\n" + "\n".join(lines)
+    else:
+        text = "You don't have any friends connected yet."
+
+    text += "\n\nChoose an option below."
+    add_friend_mode.discard(user_id)
+    remove_friend_mode.discard(user_id)
+    await message.answer(text, parse_mode="Markdown", reply_markup=friends_keyboard())
 
 
-@dp.message(F.text == "➖ Remove friend")
+@dp.message(F.text == "➖ Remove")
 async def remove_friend_handler(message: types.Message):
     user_id = message.from_user.id
     friends = await get_friend_usernames(user_id)
@@ -554,7 +618,7 @@ async def remove_friend_handler(message: types.Message):
     if not friends:
         await message.answer(
             "You don't have any friends connected yet.\n"
-            "Tap “➕ Invite friends” to add someone."
+            "Tap “➕ Invite” to add someone.",
         )
         return
 
@@ -571,7 +635,8 @@ async def start_feedback(callback: types.CallbackQuery):
     feedback_mode.add(callback.from_user.id)
     await callback.message.answer(
         "Thanks for willing to share feedback!\n"
-        "Send your thoughts in one message and I'll pass it along."
+        "Send your thoughts in one message and I'll pass it along.",
+        reply_markup=help_keyboard(),
     )
     await callback.answer()
 
@@ -632,30 +697,56 @@ async def generic_handler(message: types.Message):
     """
     user_id = message.from_user.id
     text = message.text or ""
+    user_paused = await is_paused(user_id)
 
     # 0) Feedback mode
     if user_id in feedback_mode:
         feedback_mode.discard(user_id)
+        delete_account_confirmation.discard(user_id)
         if not feedback_bot or not FEEDBACK_RECIPIENT_CHAT_ID:
             await message.answer(
-                "I couldn't deliver your feedback because the feedback bot isn't configured yet."
+                "I couldn't deliver your feedback because the feedback bot isn't configured yet.",
+                reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
             )
             return
 
         try:
             await feedback_bot.send_message(
                 FEEDBACK_RECIPIENT_CHAT_ID,
-                (
-                    "💡 New feedback\n"
-                    f"From: @{message.from_user.username or 'unknown'} (ID: {user_id})\n\n"
-                    f"{text}"
+                f"Feedback from @{message.from_user.username or 'user'} (ID: {user_id}):\n\n{text}",
+            )
+        except Exception:
+            await message.answer(
+                "Something went wrong and I couldn't send your feedback. Please try again later.",
+                reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+            )
+            return
+
+        await message.answer(
+            "Thanks! I delivered your feedback to the admin.",
+            reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+        )
+        return
+
+    # 0.1) Delete confirmation
+    if user_id in delete_account_confirmation:
+        delete_account_confirmation.discard(user_id)
+        if text == "✅ Yes, delete":
+            await delete_user_completely(user_id)
+            await message.answer(
+                "All your Kind Friends data has been deleted ✅\n\n"
+                "If you send /start again, I will treat you as a completely new user.",
+                reply_markup=ReplyKeyboardMarkup(
+                    keyboard=[[KeyboardButton(text="/start")]], resize_keyboard=True
                 ),
             )
-            await message.answer("Thanks! I sent your feedback to the creator 💌")
-        except Exception as e:
-            print(f"[WARN] Failed to forward feedback: {e}")
-            await message.answer("Sorry, I couldn't deliver your feedback right now.")
-        return
+            return
+        else:
+            await message.answer(
+                "I kept your account. You can continue using Kind Friends.",
+                reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+            )
+            return
 
     # 1) Add friend mode
     if user_id in add_friend_mode and text.startswith("@"):
@@ -731,7 +822,7 @@ async def generic_handler(message: types.Message):
 
     # 3) Link sending
     if text.startswith("http://") or text.startswith("https://"):
-        paused = await is_paused(user_id)
+        paused = user_paused
         if paused:
             await message.answer(
                 "You are currently on pause.\n"
@@ -777,9 +868,8 @@ async def generic_handler(message: types.Message):
 
     # 4) Fallback
     await message.answer(
-        "I mostly understand links and the menu buttons for now.\n"
-        "To add a friend, use “➕ Invite friends”.\n"
-        "To send a link, just paste it here."
+        "Use the buttons to open Friends or Help, or paste a link to share it with friends.",
+        reply_markup=main_keyboard(user_paused),
     )
 
 
