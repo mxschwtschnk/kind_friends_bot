@@ -21,6 +21,7 @@ FEEDBACK_BOT_TOKEN = os.getenv("FEEDBACK_BOT_TOKEN")
 FEEDBACK_RECIPIENT_CHAT_ID = int(os.getenv("FEEDBACK_RECIPIENT_CHAT_ID", "0"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+WEBHOOK_REFRESH_TOKEN = os.getenv("WEBHOOK_REFRESH_TOKEN")
 USE_POLLING = os.getenv("USE_POLLING", "false").lower() in {"1", "true", "yes"}
 
 if not WEBHOOK_URL and RENDER_EXTERNAL_URL:
@@ -933,7 +934,42 @@ async def healthcheck(request):
     """
     Simple endpoint so Render sees an open port.
     """
-    return web.Response(text="OK")
+    refreshed = await ensure_webhook()
+    return web.json_response({"status": "ok", "webhook": WEBHOOK_URL, "refreshed": refreshed})
+
+
+async def ensure_webhook(force: bool = False) -> bool:
+    """
+    Verify webhook configuration and re-register if it is missing or wrong.
+
+    Returns True if we had to change anything.
+    """
+    try:
+        info = await bot.get_webhook_info()
+        needs_refresh = force or info.url != WEBHOOK_URL
+        if needs_refresh:
+            await bot.set_webhook(WEBHOOK_URL)
+            print(f"Refreshed webhook to {WEBHOOK_URL}")
+            return True
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"[ERROR] Failed to verify or set webhook: {e}")
+        return False
+
+
+async def refresh_webhook(request):
+    """
+    Manually refresh webhook configuration.
+
+    If WEBHOOK_REFRESH_TOKEN is set, the caller must pass it as ?token=<token>.
+    """
+    if WEBHOOK_REFRESH_TOKEN:
+        token = request.query.get("token")
+        if token != WEBHOOK_REFRESH_TOKEN:
+            return web.Response(status=403, text="Invalid token")
+
+    refreshed = await ensure_webhook(force=True)
+    return web.json_response({"refreshed": refreshed, "webhook": WEBHOOK_URL})
 
 
 async def on_startup(app):
@@ -944,8 +980,11 @@ async def on_startup(app):
     """
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL)
-    print(f"Kind Friends webhook set to {WEBHOOK_URL}")
+    refreshed = await ensure_webhook(force=True)
+    if refreshed:
+        print(f"Kind Friends webhook set to {WEBHOOK_URL}")
+    else:
+        print(f"Kind Friends webhook already set to {WEBHOOK_URL}")
 
 
 async def on_shutdown(app):
@@ -976,6 +1015,7 @@ async def start_polling():
 def run_webhook_app():
     app = web.Application()
     app.router.add_get("/", healthcheck)
+    app.router.add_get("/refresh-webhook", refresh_webhook)
 
     webhook_handler = SimpleRequestHandler(dp, bot)
     webhook_handler.register(app, path="/webhook")
