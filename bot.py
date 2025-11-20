@@ -361,19 +361,64 @@ def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     """
-    /start: ensure user exists and show main menu.
-    (Можно позже расширить под deep-link инвайты)
+    /start: ensure user exists, handle invite deep-links, and show main menu.
     """
     paused = await get_or_create_user(
         message.from_user.id,
         message.from_user.username,
     )
+
+    # Handle deep-link invitation (/start <inviter_id>)
+    inviter_id: int | None = None
+    inviter_display_name: str | None = None
+
+    if message.text:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) == 2:
+            try:
+                inviter_id = int(parts[1])
+            except ValueError:
+                inviter_id = None
+
+    if inviter_id and inviter_id != message.from_user.id:
+        async with pool.acquire() as conn:
+            inviter_row = await conn.fetchrow(
+                "SELECT username FROM users WHERE telegram_id=$1",
+                inviter_id,
+            )
+
+        if inviter_row:
+            inviter_username = inviter_row["username"] or "your friend"
+            inviter_display_name = (
+                f"@{inviter_username}" if inviter_row["username"] else inviter_username
+            )
+            await add_mutual_friendship(message.from_user.id, inviter_id)
+
+            try:
+                new_user_display = (
+                    f"@{message.from_user.username}" if message.from_user.username else "A friend"
+                )
+                await bot.send_message(
+                    inviter_id,
+                    f"{new_user_display} joined Kind Friends via your link. You are now connected!",
+                )
+            except Exception as e:
+                print(f"[WARN] Failed to notify inviter {inviter_id}: {e}")
+
+    invite_note = (
+        f"\n\n✅ I connected you with {inviter_display_name}. "
+        "You can now share important links with each other."
+        if inviter_display_name
+        else ""
+    )
+
     await message.answer(
         "Hi! I’m **Kind Friends** 👋\n\n"
         "I help friends share important links with each other.\n\n"
         "• Paste a link here – I will treat it as something you want to share.\n"
         "• Use the buttons below to invite friends, see your list,\n"
-        "  manage friends, or pause/resume.\n",
+        "  manage friends, or pause/resume.\n"
+        + invite_note,
         reply_markup=main_keyboard(paused),
     )
 
