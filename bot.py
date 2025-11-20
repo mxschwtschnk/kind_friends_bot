@@ -13,6 +13,8 @@ import asyncpg
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "KindFriendsBot")  # without @
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram ID
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -22,7 +24,6 @@ if not DATABASE_URL:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Global DB pool and simple in-memory state
 pool: asyncpg.Pool | None = None
 add_friend_mode = set()  # user_ids who are adding a friend
 
@@ -47,8 +48,16 @@ async def init_db():
                 telegram_id BIGINT UNIQUE NOT NULL,
                 username TEXT,
                 is_paused BOOLEAN NOT NULL DEFAULT FALSE,
+                sent_links_count BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            """
+        )
+        # Ensure sent_links_count exists for older schema
+        await conn.execute(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS sent_links_count BIGINT NOT NULL DEFAULT 0;
             """
         )
 
@@ -273,6 +282,56 @@ async def clear_pending_links_for_user(recipient_id: int):
         )
 
 
+async def increment_sent_links(tg_id: int):
+    """
+    Increase per-user counter of sent links.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET sent_links_count = sent_links_count + 1
+            WHERE telegram_id = $1;
+            """,
+            tg_id,
+        )
+
+
+async def delete_user_completely(tg_id: int):
+    """
+    Fully remove user from Kind Friends:
+    - all friendships
+    - all pending links (sent and received)
+    - user record itself
+    """
+    async with pool.acquire() as conn:
+        # Remove friendships where user is either side
+        await conn.execute(
+            """
+            DELETE FROM friendships
+            WHERE user_telegram_id = $1
+               OR friend_telegram_id = $1;
+            """,
+            tg_id,
+        )
+
+        # Remove pending links sent or received by this user
+        await conn.execute(
+            """
+            DELETE FROM pending_links
+            WHERE recipient_telegram_id = $1
+               OR sender_telegram_id = $1;
+            """,
+            tg_id,
+        )
+
+        # Finally remove user record
+        await conn.execute(
+            "DELETE FROM users WHERE telegram_id = $1;",
+            tg_id,
+        )
+
+
 # -------------------------------------------------------------------
 # UI
 # -------------------------------------------------------------------
@@ -298,6 +357,7 @@ def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
 async def cmd_start(message: types.Message):
     """
     /start: ensure user exists and show main menu.
+    (Можно позже расширить под deep-link инвайты)
     """
     paused = await get_or_create_user(
         message.from_user.id,
@@ -366,7 +426,6 @@ async def resume_handler(message: types.Message):
         )
         return
 
-    # Group links by date
     from collections import defaultdict
 
     grouped = defaultdict(list)
@@ -385,7 +444,6 @@ async def resume_handler(message: types.Message):
 
     digest_text = "Here is what you missed while you were on pause:\n\n" + "\n".join(parts)
 
-    # Clear inbox after sending digest
     await clear_pending_links_for_user(user_id)
 
     await message.answer(
@@ -401,7 +459,7 @@ async def invite_friends_handler(message: types.Message):
     add_friend_mode.add(user_id)
     await message.answer(
         "Send me your friend's Telegram @username (for example @username).\n"
-        "They need to have started Kind Friends at least once."
+        "If they have not started Kind Friends yet, I will give you an invite link."
     )
 
 
@@ -431,7 +489,57 @@ async def feedback_handler(message: types.Message):
     await message.answer(
         "Please type your feedback or ideas in one message and send it here.\n\n"
         "(In this minimal version it will not be saved yet,\n"
-        "but later it will be forwarded to the creator.)"
+        "but later it can be forwarded to the creator.)"
+    )
+
+
+@dp.message(F.text == "/admin")
+async def admin_handler(message: types.Message):
+    """
+    Simple admin stats, available only for ADMIN_ID.
+    """
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    async with pool.acquire() as conn:
+        users_count = await conn.fetchval("SELECT COUNT(*) FROM users;")
+        paused_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE is_paused = TRUE;"
+        )
+        friendships_count = await conn.fetchval("SELECT COUNT(*) FROM friendships;")
+        pending_count = await conn.fetchval("SELECT COUNT(*) FROM pending_links;")
+        sent_links_total = await conn.fetchval(
+            "SELECT COALESCE(SUM(sent_links_count), 0) FROM users;"
+        )
+
+    text = (
+        "📊 **Kind Friends — Admin Panel**\n\n"
+        f"👥 Total users: **{users_count}**\n"
+        f"⏸ Paused users: **{paused_count}**\n"
+        f"🔗 Friend connections: **{friendships_count}**\n"
+        f"📥 Pending links (stored for paused): **{pending_count}**\n"
+        f"📤 Total links sent attempts: **{sent_links_total}**\n"
+    )
+
+    await message.answer(text, parse_mode="Markdown")
+
+
+@dp.message(F.text == "/wipe_me")
+async def wipe_me_handler(message: types.Message):
+    """
+    Completely delete current user from DB.
+    Restricted to ADMIN_ID for testing.
+    """
+    if message.from_user.id != ADMIN_ID:
+        await message.answer(
+            "This destructive testing command is only available to the creator for now."
+        )
+        return
+
+    await delete_user_completely(message.from_user.id)
+    await message.answer(
+        "All your Kind Friends data has been deleted ✅\n\n"
+        "If you send /start again, I will treat you as a completely new user."
     )
 
 
@@ -439,7 +547,7 @@ async def feedback_handler(message: types.Message):
 async def generic_handler(message: types.Message):
     """
     Generic handler:
-    - add friend by @username
+    - add friend by @username (with invite fallback)
     - remove friend via -@username
     - send links to friends or store for paused friends
     - fallback text
@@ -449,43 +557,42 @@ async def generic_handler(message: types.Message):
 
     # 1) Add friend mode
     if user_id in add_friend_mode and text.startswith("@"):
-    add_friend_mode.discard(user_id)
-    friend_username_raw = text.strip().lstrip("@").lower()
+        add_friend_mode.discard(user_id)
+        friend_username_raw = text.strip()
 
-    # Try to find friend in DB
-    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+        friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+        clean_username = friend_username_raw.lstrip("@")
 
-    if not friend_tg_id:
-        # friend not in Kind Friends yet → give invite link
-        invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
+        if not friend_tg_id:
+            invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
+            await message.answer(
+                "I can't find this user in **Kind Friends** yet.\n\n"
+                "Send them this invite link and ask them to press Start:\n"
+                f"{invite_link}"
+            )
+            return
+
+        if friend_tg_id == user_id:
+            await message.answer("You cannot add yourself 🙂")
+            return
+
+        await add_mutual_friendship(user_id, friend_tg_id)
+
+        # Notify friend (best-effort)
+        try:
+            await bot.send_message(
+                friend_tg_id,
+                f"@{message.from_user.username} added you as a friend on **Kind Friends** 🎉",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to notify friend {friend_tg_id}: {e}")
+
         await message.answer(
-            "Your friend hasn't started **Kind Friends** yet.\n\n"
-            "Send them this link and ask them to press Start:\n"
-            f"{invite_link}"
+            f"You are now connected with @{clean_username}. "
+            "You can share links with each other."
         )
         return
-
-    if friend_tg_id == user_id:
-        await message.answer("You cannot add yourself 🙂")
-        return
-
-    await add_mutual_friendship(user_id, friend_tg_id)
-
-    # Notify friend (if possible)
-    try:
-        await bot.send_message(
-            friend_tg_id,
-            f"@{message.from_user.username} added you as a friend on **Kind Friends** 🎉"
-        )
-    except:
-        pass
-
-    await message.answer(
-        f"You are now connected with @{friend_username_raw}. "
-        "You can share links with each other."
-    )
-    return
-
 
     # 2) Remove friend: -@username
     if text.startswith("-@"):
@@ -503,7 +610,6 @@ async def generic_handler(message: types.Message):
 
     # 3) Link sending
     if text.startswith("http://") or text.startswith("https://"):
-        # If sender is paused — do not send
         paused = await is_paused(user_id)
         if paused:
             await message.answer(
@@ -520,11 +626,9 @@ async def generic_handler(message: types.Message):
         for fid in friends_ids:
             try:
                 if await is_paused(fid):
-                    # friend is paused → store link
                     await save_pending_link(fid, user_id, text)
                     stored_count += 1
                 else:
-                    # friend is active → send now
                     await bot.send_message(
                         fid,
                         f"@{sender_username} shared a link with you:\n{text}",
@@ -532,6 +636,9 @@ async def generic_handler(message: types.Message):
                     sent_count += 1
             except Exception as e:
                 print(f"[WARN] Failed to deliver link to {fid}: {e}")
+
+        # increment personal counter
+        await increment_sent_links(user_id)
 
         if sent_count == 0 and stored_count == 0:
             await message.answer(
