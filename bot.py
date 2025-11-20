@@ -1,6 +1,7 @@
 import os
-from aiohttp import web
+import asyncio
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
@@ -12,39 +13,32 @@ import asyncpg
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
-
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
-
-if not WEBHOOK_URL:
-    raise RuntimeError("WEBHOOK_URL is not set")
-
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Global DB connection pool and simple in-memory state
-pool = None
-add_friend_mode = set()  # set of user_ids who are currently adding a friend
+pool: asyncpg.Pool | None = None
+add_friend_mode = set()  # user_ids who are adding a friend
 
 
 # -------------------------------------------------------------------
-# DATABASE HELPERS
+# DATABASE
 # -------------------------------------------------------------------
 
 async def init_db():
     """
-    Create a connection pool and ensure tables exist.
+    Create pool and tables if they do not exist.
     """
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with pool.acquire() as conn:
-        # Users table
+        # users
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -56,7 +50,7 @@ async def init_db():
             );
             """
         )
-        # Friendships table (store relations by telegram_id)
+        # friendships
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS friendships (
@@ -70,10 +64,9 @@ async def init_db():
         )
 
 
-async def get_or_create_user(tg_id, username):
+async def get_or_create_user(tg_id: int, username: str | None) -> bool:
     """
-    Return pause state for user, creating them if needed.
-    Username is updated each time.
+    Returns is_paused flag; creates user if not exists.
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -96,34 +89,27 @@ async def get_or_create_user(tg_id, username):
         return False
 
 
-async def set_pause(tg_id, paused):
-    """
-    Set pause state for user.
-    """
+async def set_pause(tg_id: int, paused: bool):
     async with pool.acquire() as conn:
-        # Ensure user exists
         row = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
             tg_id,
         )
-        if not row:
-            await conn.execute(
-                "INSERT INTO users (telegram_id, is_paused) VALUES ($1, $2)",
-                tg_id,
-                paused,
-            )
-        else:
+        if row:
             await conn.execute(
                 "UPDATE users SET is_paused=$1 WHERE telegram_id=$2",
                 paused,
                 tg_id,
             )
+        else:
+            await conn.execute(
+                "INSERT INTO users (telegram_id, is_paused) VALUES ($1, $2)",
+                tg_id,
+                paused,
+            )
 
 
-async def is_paused(tg_id):
-    """
-    Check if user is paused.
-    """
+async def is_paused(tg_id: int) -> bool:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT is_paused FROM users WHERE telegram_id=$1",
@@ -132,15 +118,10 @@ async def is_paused(tg_id):
     return row["is_paused"] if row else False
 
 
-async def get_telegram_id_by_username(username):
-    """
-    Find a user by username (case-insensitive).
-    Username is stored without @ in Telegram, so we strip it.
-    """
-    username = username.lstrip("@").strip().lower()
+async def get_telegram_id_by_username(username: str | None):
     if not username:
         return None
-
+    username = username.lstrip("@").strip().lower()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT telegram_id FROM users WHERE LOWER(username)=$1",
@@ -149,10 +130,7 @@ async def get_telegram_id_by_username(username):
     return row["telegram_id"] if row else None
 
 
-async def add_mutual_friendship(a_tg_id, b_tg_id):
-    """
-    Create mutual friendship between two users (A<->B).
-    """
+async def add_mutual_friendship(a_tg_id: int, b_tg_id: int):
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -174,10 +152,7 @@ async def add_mutual_friendship(a_tg_id, b_tg_id):
         )
 
 
-async def get_friend_usernames(tg_id):
-    """
-    Return a list of usernames for all friends of a user.
-    """
+async def get_friend_usernames(tg_id: int):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -192,10 +167,7 @@ async def get_friend_usernames(tg_id):
     return [r["username"] for r in rows if r["username"]]
 
 
-async def get_active_friend_ids(tg_id):
-    """
-    Return telegram_ids of all friends who are not paused.
-    """
+async def get_active_friend_ids(tg_id: int):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -210,10 +182,7 @@ async def get_active_friend_ids(tg_id):
     return [r["telegram_id"] for r in rows]
 
 
-async def remove_friendship(a_tg_id, b_tg_id):
-    """
-    Remove friendship in both directions (A-B and B-A).
-    """
+async def remove_friendship(a_tg_id: int, b_tg_id: int):
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -227,15 +196,11 @@ async def remove_friendship(a_tg_id, b_tg_id):
 
 
 # -------------------------------------------------------------------
-# KEYBOARD
+# UI
 # -------------------------------------------------------------------
 
-def main_keyboard(paused):
-    """
-    Main menu keyboard for Kind Friends.
-    """
+def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
     pause_button = "▶️ Resume" if paused else "⏸ Pause"
-
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📤 Send a link")],
@@ -252,10 +217,7 @@ def main_keyboard(paused):
 # -------------------------------------------------------------------
 
 @dp.message(CommandStart())
-async def start(message: types.Message):
-    """
-    /start handler: create or load user and show main menu.
-    """
+async def cmd_start(message: types.Message):
     paused = await get_or_create_user(
         message.from_user.id,
         message.from_user.username,
@@ -289,9 +251,6 @@ async def help_handler(message: types.Message):
 
 @dp.message(F.text == "⏸ Pause")
 async def pause_handler(message: types.Message):
-    """
-    Enable pause mode.
-    """
     user_id = message.from_user.id
     await set_pause(user_id, True)
     await message.answer(
@@ -306,9 +265,6 @@ async def pause_handler(message: types.Message):
 
 @dp.message(F.text == "▶️ Resume")
 async def resume_handler(message: types.Message):
-    """
-    Disable pause mode.
-    """
     user_id = message.from_user.id
     await set_pause(user_id, False)
     await message.answer(
@@ -320,9 +276,6 @@ async def resume_handler(message: types.Message):
 
 @dp.message(F.text == "➕ Invite friends")
 async def invite_friends_handler(message: types.Message):
-    """
-    Start 'add friend' mode.
-    """
     user_id = message.from_user.id
     add_friend_mode.add(user_id)
     await message.answer(
@@ -333,9 +286,6 @@ async def invite_friends_handler(message: types.Message):
 
 @dp.message(F.text == "👥 Friends")
 async def friends_handler(message: types.Message):
-    """
-    Show list of friends and how to remove them.
-    """
     user_id = message.from_user.id
     friends = await get_friend_usernames(user_id)
 
@@ -366,22 +316,13 @@ async def feedback_handler(message: types.Message):
 
 @dp.message()
 async def generic_handler(message: types.Message):
-    """
-    Handles:
-    - add friend by @username (when in add_friend_mode)
-    - remove friend by '-@username'
-    - direct link messages
-    - everything else
-    """
     user_id = message.from_user.id
     text = message.text or ""
 
-    # 1) If user is in "add friend" mode
+    # 1) Add friend mode
     if user_id in add_friend_mode and text.startswith("@"):
         add_friend_mode.discard(user_id)
         friend_username_raw = text.strip()
-        friend_username = friend_username_raw.lstrip("@")
-
         friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
         if not friend_tg_id:
             await message.answer(
@@ -389,34 +330,32 @@ async def generic_handler(message: types.Message):
                 "Ask them to start the bot at least once, then try again."
             )
             return
-
         if friend_tg_id == user_id:
             await message.answer("You cannot add yourself as a friend 🙂")
             return
 
         await add_mutual_friendship(user_id, friend_tg_id)
         await message.answer(
-            f"You are now connected with @{friend_username}. "
+            f"You are now connected with {friend_username_raw}. "
             "You can share links with each other."
         )
         return
 
-    # 2) Removing a friend: pattern '-@username'
+    # 2) Remove friend: -@username
     if text.startswith("-@"):
         friend_username_raw = text[2:].strip()
         friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-
         if not friend_tg_id:
             await message.answer("I can't find this friend in Kind Friends.")
             return
 
         await remove_friendship(user_id, friend_tg_id)
         await message.answer(
-            f"You are no longer connected with @{friend_username_raw.lstrip('@')} on Kind Friends."
+            f"You are no longer connected with {friend_username_raw} on Kind Friends."
         )
         return
 
-    # 3) Sending a link
+    # 3) Link sending
     if text.startswith("http://") or text.startswith("https://"):
         paused = await is_paused(user_id)
         if paused:
@@ -426,7 +365,6 @@ async def generic_handler(message: types.Message):
             )
             return
 
-        # Find all active friends and send them the link
         friends_ids = await get_active_friend_ids(user_id)
         sender_username = message.from_user.username or "your friend"
         sent_count = 0
@@ -453,7 +391,7 @@ async def generic_handler(message: types.Message):
             )
         return
 
-    # 4) Unknown text
+    # 4) Fallback
     await message.answer(
         "I mostly understand links and the menu buttons for now.\n"
         "To add a friend, use “➕ Invite friends”.\n"
@@ -462,41 +400,46 @@ async def generic_handler(message: types.Message):
 
 
 # -------------------------------------------------------------------
-# AIOHTTP WEB SERVER FOR WEBHOOK
+# AIOHTTP APP + LONG POLLING
 # -------------------------------------------------------------------
 
-async def handle(request):
+async def healthcheck(request):
     """
-    AIOHTTP handler for incoming Telegram webhooks.
+    Simple healthcheck endpoint so Render sees an open port.
     """
-    data = await request.json()
-    update = types.Update(**data)
-    await dp.feed_update(bot, update)
-    return web.Response()
+    return web.Response(text="OK")
 
 
 async def on_startup(app):
     """
-    Called when web app starts.
-    - Initialize DB
-    - Set Telegram webhook
+    On startup:
+    - init DB
+    - delete webhook (in case it was set)
+    - start aiogram long polling in background
     """
     await init_db()
-    await bot.set_webhook(WEBHOOK_URL)
-    print("Webhook is set:", WEBHOOK_URL)
+    # Ensure webhook is disabled (we use getUpdates long polling)
+    await bot.delete_webhook(drop_pending_updates=True)
+    app["bot_task"] = asyncio.create_task(dp.start_polling(bot))
+    print("Kind Friends bot polling started.")
 
 
 async def on_shutdown(app):
     """
-    Called on shutdown: remove webhook.
+    On shutdown:
+    - cancel polling task
+    - close bot session
     """
-    await bot.delete_webhook()
-    print("Webhook removed")
+    bot_task = app.get("bot_task")
+    if bot_task:
+        bot_task.cancel()
+    await bot.session.close()
+    print("Kind Friends bot stopped.")
 
 
 def main():
     app = web.Application()
-    app.router.add_post("/", handle)
+    app.router.add_get("/", healthcheck)
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
