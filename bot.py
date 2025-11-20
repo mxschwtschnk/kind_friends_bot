@@ -1,6 +1,7 @@
 import os
 
 import asyncio
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -931,13 +932,47 @@ async def start_polling():
     """
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
+    health_runner = await start_healthcheck_server()
     try:
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
         if feedback_bot:
             await feedback_bot.session.close()
+        if health_runner:
+            await health_runner.cleanup()
         print("Kind Friends bot stopped.")
+
+
+async def start_healthcheck_server() -> web.AppRunner | None:
+    """
+    Start a minimal HTTP server if PORT is set (Render free Web Service).
+    Returns the runner so it can be cleaned up on shutdown.
+    """
+
+    port_value = os.getenv("PORT")
+    if not port_value:
+        return None
+
+    try:
+        port = int(port_value)
+    except ValueError:
+        print(f"[WARN] Invalid PORT value: {port_value}")
+        return None
+
+    app = web.Application()
+
+    async def health(_request: web.Request):
+        return web.Response(text="OK")
+
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Healthcheck server listening on port {port}")
+    return runner
+
 
 def main():
     asyncio.run(start_polling())
