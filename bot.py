@@ -16,8 +16,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "KindFriendsBot")  # without @
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram ID
-FEEDBACK_BOT_TOKEN = os.getenv("FEEDBACK_BOT_TOKEN")
-FEEDBACK_RECIPIENT_CHAT_ID = int(os.getenv("FEEDBACK_RECIPIENT_CHAT_ID", "0"))
+
+feedback_recipient_raw = os.getenv("FEEDBACK_RECIPIENT_CHAT_ID")
+FEEDBACK_RECIPIENT_CHAT_ID = (
+    int(feedback_recipient_raw) if feedback_recipient_raw else ADMIN_ID
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -25,7 +28,6 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
 bot = Bot(token=BOT_TOKEN)
-feedback_bot = Bot(token=FEEDBACK_BOT_TOKEN) if FEEDBACK_BOT_TOKEN else None
 dp = Dispatcher()
 
 pool: asyncpg.Pool | None = None
@@ -435,6 +437,35 @@ def feedback_keyboard() -> ReplyKeyboardMarkup:
 
 
 # -------------------------------------------------------------------
+# FEEDBACK
+# -------------------------------------------------------------------
+
+
+async def deliver_feedback_to_admin(sender: types.User, text: str) -> bool:
+    """
+    Send feedback to the admin (or explicitly configured recipient).
+    Returns True on success, False otherwise.
+    """
+
+    target_chat_id = FEEDBACK_RECIPIENT_CHAT_ID or ADMIN_ID
+    if not target_chat_id:
+        return False
+
+    sender_display = (
+        f"@{sender.username}" if sender.username else sender.full_name or "A user"
+    )
+    try:
+        await bot.send_message(
+            target_chat_id,
+            f"Feedback from {sender_display} (ID: {sender.id}):\n\n{text}",
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to deliver feedback to {target_chat_id}: {e}")
+        return False
+
+
+# -------------------------------------------------------------------
 # HANDLERS
 # -------------------------------------------------------------------
 
@@ -755,21 +786,10 @@ async def generic_handler(message: types.Message):
         if user_id in feedback_mode:
             feedback_mode.discard(user_id)
             delete_account_confirmation.discard(user_id)
-            if not feedback_bot or not FEEDBACK_RECIPIENT_CHAT_ID:
+            delivered = await deliver_feedback_to_admin(message.from_user, text)
+            if not delivered:
                 await message.answer(
-                    "I couldn't deliver your feedback because the feedback bot isn't configured yet.",
-                    reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
-                )
-                return
-
-            try:
-                await feedback_bot.send_message(
-                    FEEDBACK_RECIPIENT_CHAT_ID,
-                    f"Feedback from @{message.from_user.username or 'user'} (ID: {user_id}):\n\n{text}",
-                )
-            except Exception:
-                await message.answer(
-                    "Something went wrong and I couldn't send your feedback. Please try again later.",
+                    "I couldn't deliver your feedback because the admin destination isn't configured yet.",
                     reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
                 )
                 return
@@ -936,8 +956,6 @@ async def start_polling():
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
-        if feedback_bot:
-            await feedback_bot.session.close()
         if health_runner:
             await health_runner.cleanup()
         print("Kind Friends bot stopped.")
