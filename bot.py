@@ -545,6 +545,10 @@ def help_keyboard() -> ReplyKeyboardMarkup:
 
 
 def feedback_keyboard() -> ReplyKeyboardMarkup:
+    return back_only_keyboard()
+
+
+def back_only_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="⬅️ Back")]],
         resize_keyboard=True,
@@ -779,7 +783,8 @@ async def invite_friends_handler(message: types.Message):
     remove_friend_mode.discard(user_id)
     await message.answer(
         "Send me your friend's Telegram @username (for example @username).\n"
-        "If they have not started Kind Friends yet, I will give you an invite link."
+        "If they have not started Kind Friends yet, I will give you an invite link.",
+        reply_markup=back_only_keyboard(),
     )
 
 
@@ -823,7 +828,8 @@ async def remove_friend_handler(message: types.Message):
     add_friend_mode.discard(user_id)
     await message.answer(
         "Send me the @username of the friend you want to remove.\n"
-        "You can copy it from the list in “👥 Friends”."
+        "You can copy it from the list in “👥 Friends”.",
+        reply_markup=back_only_keyboard(),
     )
 
 
@@ -1027,24 +1033,30 @@ async def generic_handler(message: types.Message):
                     "👋 I'm using Kind Friends to share interesting links with friends.\n\n"
                     f"I'd love to add you—open this link and press *Start* to join: {invite_link}",
                     parse_mode="Markdown",
+                    reply_markup=friends_keyboard(),
                 )
                 return
 
             if friend_tg_id == user_id:
-                await message.answer("You cannot add yourself 🙂")
+                await message.answer(
+                    "You cannot add yourself 🙂",
+                    reply_markup=friends_keyboard(),
+                )
                 return
 
             existing_friends = await get_all_friend_ids(user_id)
             if friend_tg_id in existing_friends:
                 await message.answer(
-                    f"You are already connected with @{clean_username} in Kind Friends."
+                    f"You are already connected with @{clean_username} in Kind Friends.",
+                    reply_markup=friends_keyboard(),
                 )
                 return
 
             outgoing_request = await get_pending_friend_request(user_id, friend_tg_id)
             if outgoing_request:
                 await message.answer(
-                    "You already sent an invitation. Please wait for your friend to respond."
+                    "You already sent an invitation. Please wait for your friend to respond.",
+                    reply_markup=friends_keyboard(),
                 )
                 return
 
@@ -1058,7 +1070,8 @@ async def generic_handler(message: types.Message):
                 user_display = display_username(message.from_user.username, "friend")
 
                 await message.answer(
-                    f"You confirmed the request from {friend_display}. You're now friends."
+                    f"You confirmed the request from {friend_display}. You're now friends.",
+                    reply_markup=friends_keyboard(),
                 )
                 try:
                     await bot.send_message(
@@ -1072,14 +1085,16 @@ async def generic_handler(message: types.Message):
             request_id = await create_friend_request(user_id, friend_tg_id)
             if not request_id:
                 await message.answer(
-                    "I couldn't send the request right now. Please try again in a bit."
+                    "I couldn't send the request right now. Please try again in a bit.",
+                    reply_markup=friends_keyboard(),
                 )
                 return
 
             friend_username = await get_username_by_telegram_id(friend_tg_id)
             friend_display = display_username(friend_username or clean_username, "friend")
             await message.answer(
-                f"Request sent to {friend_display}. Waiting for confirmation."
+                f"Request sent to {friend_display}. Waiting for confirmation.",
+                reply_markup=friends_keyboard(),
             )
 
             requester_display = display_username(message.from_user.username, "User")
@@ -1114,17 +1129,24 @@ async def generic_handler(message: types.Message):
             remove_friend_mode.discard(user_id)
             friend_username_raw = normalize_username_input(text)
             if not friend_username_raw:
-                await message.answer("Please send a valid @username to remove a friend.")
+                await message.answer(
+                    "Please send a valid @username to remove a friend.",
+                    reply_markup=friends_keyboard(),
+                )
                 return
 
             friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
             if not friend_tg_id:
-                await message.answer("I can't find this friend in Kind Friends.")
+                await message.answer(
+                    "I can't find this friend in Kind Friends.",
+                    reply_markup=friends_keyboard(),
+                )
                 return
 
             await remove_friendship(user_id, friend_tg_id)
             await message.answer(
-                f"You are no longer connected with @{friend_username_raw} on Kind Friends."
+                f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
+                reply_markup=friends_keyboard(),
             )
             return
 
