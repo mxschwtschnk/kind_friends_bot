@@ -407,6 +407,12 @@ async def get_username_by_telegram_id(tg_id: int) -> str | None:
     return row["username"] if row else None
 
 
+async def get_all_user_ids() -> list[int]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT telegram_id FROM users;")
+    return [row["telegram_id"] for row in rows]
+
+
 async def get_pending_friend_request(
     requester_id: int, recipient_id: int
 ) -> asyncpg.Record | None:
@@ -1143,6 +1149,42 @@ async def admin_handler(message: types.Message):
     )
 
     await message.answer(text, parse_mode="Markdown")
+
+
+@dp.message(F.text.startswith("/broadcast"))
+async def broadcast_handler(message: types.Message):
+    """
+    Broadcast a text message to all registered users.
+    Only the configured ADMIN_ID can use this command.
+    """
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "Usage: /broadcast <message to send to all users>",
+        )
+        return
+
+    broadcast_text = parts[1].strip()
+    user_ids = await get_all_user_ids()
+
+    delivered = 0
+    failed = 0
+
+    for user_id in user_ids:
+        try:
+            await bot.send_message(user_id, broadcast_text)
+            delivered += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] Failed to broadcast to {user_id}: {e}")
+            failed += 1
+
+    await message.answer(
+        f"Broadcast complete. Delivered: {delivered}. Failed: {failed}.",
+    )
 
 
 @dp.message(F.text == "/wipe_me")
