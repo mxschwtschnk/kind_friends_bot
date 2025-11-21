@@ -1356,6 +1356,14 @@ async def generic_handler(message: types.Message):
     async with LoadingIndicator(message):
         # 0) Feedback mode
         if user_id in feedback_mode:
+            if message.content_type != types.ContentType.TEXT:
+                await message.answer(
+                    "I couldn't deliver your feedback because it included media. "
+                    "Please send your feedback as plain text without any photos, videos, or other attachments so I can pass it along.",
+                    reply_markup=feedback_keyboard(),
+                )
+                return
+
             feedback_mode.discard(user_id)
             delete_account_confirmation.discard(user_id)
             delivered = await deliver_feedback_to_admin(message.from_user, text)
