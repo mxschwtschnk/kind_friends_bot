@@ -1,4 +1,6 @@
 import os
+from datetime import datetime, timedelta, timezone
+import math
 
 import asyncio
 from aiohttp import web
@@ -162,6 +164,18 @@ async def init_db():
                 sender_telegram_id BIGINT NOT NULL,
                 url TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+
+        # Track when users last sent a specific link (spam control)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sent_links_history (
+                sender_telegram_id BIGINT NOT NULL,
+                url TEXT NOT NULL,
+                sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (sender_telegram_id, url)
             );
             """
         )
@@ -505,6 +519,40 @@ async def increment_sent_links(tg_id: int):
             WHERE telegram_id = $1;
             """,
             tg_id,
+        )
+
+
+async def get_recent_sent_link_timestamp(sender_id: int, url: str):
+    """
+    Return the last time the sender shared the exact URL, if any.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT sent_at
+            FROM sent_links_history
+            WHERE sender_telegram_id = $1 AND url = $2;
+            """,
+            sender_id,
+            url,
+        )
+    return row["sent_at"] if row else None
+
+
+async def record_sent_link(sender_id: int, url: str):
+    """
+    Upsert the timestamp for a sent link to enforce cooldowns.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO sent_links_history (sender_telegram_id, url, sent_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (sender_telegram_id, url)
+            DO UPDATE SET sent_at = EXCLUDED.sent_at;
+            """,
+            sender_id,
+            url,
         )
 
 
@@ -1312,6 +1360,19 @@ async def generic_handler(message: types.Message):
 
         # 3) Link sending
         if text.startswith("http://") or text.startswith("https://"):
+            recent_sent_at = await get_recent_sent_link_timestamp(user_id, text)
+            if recent_sent_at:
+                retry_after = recent_sent_at + timedelta(days=7)
+                now = datetime.now(timezone.utc)
+                if now < retry_after:
+                    remaining_seconds = (retry_after - now).total_seconds()
+                    remaining_days = max(1, math.ceil(remaining_seconds / 86400))
+                    await message.answer(
+                        "You already shared this link recently.\n"
+                        f"Please wait {remaining_days} day(s) before sending it again to avoid spam.",
+                    )
+                    return
+
             paused = user_paused
             if paused:
                 await message.answer(
@@ -1341,6 +1402,7 @@ async def generic_handler(message: types.Message):
 
             # increment personal counter
             await increment_sent_links(user_id)
+            await record_sent_link(user_id, text)
 
             if sent_count == 0 and stored_count == 0:
                 await message.answer(
