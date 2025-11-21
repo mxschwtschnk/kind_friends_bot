@@ -878,10 +878,11 @@ async def cmd_start(message: types.Message):
     )
 
     await message.answer(
-        "Hi! I’m **Kind Friends** 👋\n\n"
-        "I help friends share important links with each other.\n\n"
-        "Paste a link here – I will treat it as something you want to share.\n"
-        "• Use the buttons to open Friends, pause/resume, or read help.\n"
+        "Hey 👋 I help friends share their links and content to support each other with likes, shares, and comments.\n\n"
+        "• Create your circle of friends (up to 15)\n"
+        "• Paste a link here and I will share it with your circle.\n"
+        "• Use the buttons to open Friends, Pause/Resume, or get more information in Help.\n\n"
+        "*This is an MVP version. Your feedback is very welcome!*\n"
         + invite_note,
         reply_markup=main_keyboard(paused),
     )
