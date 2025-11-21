@@ -739,7 +739,7 @@ def help_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📖 How to"), KeyboardButton(text="💬 Feedback")],
-            [KeyboardButton(text="🗑 Delete Account")],
+            [KeyboardButton(text="🧹 Wipe Account")],
             [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
@@ -889,17 +889,17 @@ async def how_to_handler(message: types.Message):
     )
 
 
-@dp.message(F.text == "🗑 Delete Account")
+@dp.message(F.text == "🧹 Wipe Account")
 async def delete_account_prompt(message: types.Message):
     user_id = message.from_user.id
     delete_account_confirmation.add(user_id)
     await message.answer(
-        "Are you sure you want to delete your Kind Friends account?\n\n"
+        "Are you sure you want to wipe your Kind Friends account?\n\n"
         "This will remove all friends, delete any stored pending links, and new links will no longer arrive.\n"
         "Continue?",
         reply_markup=ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="Yes, delete"), KeyboardButton(text="No, keep my account")],
+                [KeyboardButton(text="Yes, wipe"), KeyboardButton(text="No, keep my account")],
             ],
             resize_keyboard=True,
         ),
@@ -1313,7 +1313,7 @@ async def wipe_me_handler(message: types.Message):
     await delete_user_completely(user_id)
     await message.answer(
         "All your Kind Friends data has been deleted ✅\n\n"
-        "If you send /start again, I will treat you as a completely new user."
+        "You’re starting from scratch—just like you’ve never used Kind Friends before."
     )
 
 
@@ -1352,13 +1352,13 @@ async def generic_handler(message: types.Message):
         # 0.1) Delete confirmation
         if user_id in delete_account_confirmation:
             delete_account_confirmation.discard(user_id)
-            if text == "Yes, delete":
+            if text == "Yes, wipe":
                 await delete_user_completely(user_id)
                 await message.answer(
                     "All your Kind Friends data has been deleted ✅\n\n"
-                    "If you send /start again, I will treat you as a completely new user.",
+                    "You’re starting from scratch—just like you’ve never used Kind Friends before.",
                     reply_markup=ReplyKeyboardMarkup(
-                        keyboard=[[KeyboardButton(text="Start")]], resize_keyboard=True
+                        keyboard=[[KeyboardButton(text="Let’s start again")]], resize_keyboard=True
                     ),
                 )
                 return
