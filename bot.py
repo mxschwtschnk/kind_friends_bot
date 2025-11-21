@@ -367,6 +367,21 @@ async def remove_friendship(a_tg_id: int, b_tg_id: int):
         )
 
 
+async def notify_friend_removed(remover_id: int, friend_id: int):
+    """Notify a friend that they were removed from someone's list."""
+
+    remover_username = await get_username_by_telegram_id(remover_id)
+    remover_display = display_username(remover_username, "A friend")
+
+    try:
+        await bot.send_message(
+            friend_id,
+            f"{remover_display} removed you from Kind Friends. You are no longer connected.",
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to notify user {friend_id} about removal: {e}")
+
+
 async def count_pending_requests_for_requester(tg_id: int) -> int:
     async with pool.acquire() as conn:
         return await conn.fetchval(
@@ -742,6 +757,19 @@ def back_only_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def remove_friends_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"@{username}",
+                callback_data=f"remove_friend:{username}",
+            )
+        ]
+        for username in friends
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 # -------------------------------------------------------------------
 # FEEDBACK
 # -------------------------------------------------------------------
@@ -1016,10 +1044,65 @@ async def remove_friend_handler(message: types.Message):
     remove_friend_mode.add(user_id)
     add_friend_mode.discard(user_id)
     await message.answer(
-        "Send me the @username of the friend you want to remove.\n"
-        "You can copy it from the list in “👥 Friends”.",
+        "You can now delete your friends from the list.\n"
+        "Choose one or a few by clicking on the tags below.",
         reply_markup=back_only_keyboard(),
     )
+    await message.answer(
+        "Tap a friend to remove them:",
+        reply_markup=remove_friends_keyboard(friends),
+    )
+
+
+@dp.callback_query(F.data.startswith("remove_friend:"))
+async def remove_friend_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
+    if user_id not in remove_friend_mode:
+        await callback.answer("Remove mode is closed. Tap ➖ Remove to start again.", show_alert=True)
+        return
+
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid remove action.", show_alert=True)
+        return
+
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
+        return
+
+    await remove_friendship(user_id, friend_tg_id)
+    await notify_friend_removed(user_id, friend_tg_id)
+
+    await callback.answer("Friend removed.")
+    await callback.message.answer(
+        f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
+        reply_markup=back_only_keyboard(),
+    )
+
+    updated_friends = await get_friend_usernames(user_id)
+    if updated_friends:
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=remove_friends_keyboard(updated_friends)
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] Failed to refresh removal keyboard for {user_id}: {e}")
+    else:
+        remove_friend_mode.discard(user_id)
+        try:
+            await callback.message.edit_text(
+                "You don't have any friends connected yet.\nTap “➕ Invite” to add someone.",
+                reply_markup=None,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] Failed to update empty removal message for {user_id}: {e}")
+        await callback.message.answer(
+            "Friend list is empty now. Returning to Friends menu.",
+            reply_markup=friends_keyboard(),
+        )
 
 
 @dp.callback_query(F.data.startswith("friend_accept:"))
@@ -1470,6 +1553,7 @@ async def generic_handler(message: types.Message):
                 return
 
             await remove_friendship(user_id, friend_tg_id)
+            await notify_friend_removed(user_id, friend_tg_id)
             await message.answer(
                 f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
                 reply_markup=friends_keyboard(),
@@ -1488,6 +1572,7 @@ async def generic_handler(message: types.Message):
                 return
 
             await remove_friendship(user_id, friend_tg_id)
+            await notify_friend_removed(user_id, friend_tg_id)
             await message.answer(
                 f"You are no longer connected with {friend_username_raw} on Kind Friends."
             )
