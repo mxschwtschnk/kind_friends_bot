@@ -118,6 +118,7 @@ async def init_db():
                 username TEXT,
                 is_paused BOOLEAN NOT NULL DEFAULT FALSE,
                 sent_links_count BIGINT NOT NULL DEFAULT 0,
+                invites_sent_count BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
@@ -127,6 +128,12 @@ async def init_db():
             """
             ALTER TABLE users
             ADD COLUMN IF NOT EXISTS sent_links_count BIGINT NOT NULL DEFAULT 0;
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS invites_sent_count BIGINT NOT NULL DEFAULT 0;
             """
         )
         await conn.execute(
@@ -585,6 +592,21 @@ async def increment_sent_links(tg_id: int) -> int:
             tg_id,
         )
     return row["sent_links_today_count"] if row else 0
+
+
+async def increment_invites_sent(tg_id: int):
+    """
+    Increase per-user counter of sent invites.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET invites_sent_count = invites_sent_count + 1
+            WHERE telegram_id = $1;
+            """,
+            tg_id,
+        )
 
 
 async def get_recent_sent_link_timestamp(sender_id: int, url: str):
@@ -1138,6 +1160,9 @@ async def admin_handler(message: types.Message):
         sent_links_total = await conn.fetchval(
             "SELECT COALESCE(SUM(sent_links_count), 0) FROM users;"
         )
+        invites_sent_total = await conn.fetchval(
+            "SELECT COALESCE(SUM(invites_sent_count), 0) FROM users;"
+        )
 
     text = (
         "📊 **Kind Friends — Admin Panel**\n\n"
@@ -1146,6 +1171,7 @@ async def admin_handler(message: types.Message):
         f"🔗 Friend connections: **{friendships_count}**\n"
         f"📥 Pending links (stored for paused): **{pending_count}**\n"
         f"📤 Total links sent attempts: **{sent_links_total}**\n"
+        f"✉️ Total invites sent: **{invites_sent_total}**\n"
     )
 
     await message.answer(text, parse_mode="Markdown")
@@ -1272,6 +1298,7 @@ async def generic_handler(message: types.Message):
             clean_username = friend_username_raw.lstrip("@")
 
             if not friend_tg_id:
+                await increment_invites_sent(user_id)
                 invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
                 await message.answer(
                     "I can't find this user in **Kind Friends** yet.\n\n"
