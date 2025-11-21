@@ -1047,8 +1047,8 @@ async def invite_friends_handler(message: types.Message):
     )
     await message.answer(
         "👋 I'm using Kind Friends to share interesting links with friends.\n\n"
-        f"I'd love to add you—open this link and press *Start* to join: {invite_link}",
-        parse_mode="Markdown",
+        f"I'd love to add you—open this link and press <b>Start</b> to join: {invite_link}",
+        parse_mode="HTML",
     )
 
 
