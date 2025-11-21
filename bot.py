@@ -903,8 +903,31 @@ async def help_handler(message: types.Message):
 @dp.message(F.text == "📖 How to")
 async def how_to_handler(message: types.Message):
     await message.answer(
-        "Paste any link here to share it with all your connected friends.\n"
-        "Use Friends to add/remove people, and Pause to stop sending/receiving until you resume.",
+        "This should be a message under How to\n\n"
+        "1️⃣ Sharing links\n"
+        "• Paste any http(s) link into the chat.\n"
+        "• I send it to all your connected friends who are not on pause.\n"
+        "• Friends who are on pause get your links later in a digest when they resume.\n\n"
+        "2️⃣ Daily limits & anti-spam\n"
+        "• You can share up to 5 links per day.\n"
+        "• The same exact link can only be sent again after 7 days (to avoid spam).\n\n"
+        "3️⃣ Adding friends\n"
+        "• Tap “👥 Friends →➕ Invite” and send your friend’s @username.\n"
+        "• If they already use Kind Friends, they get a request to connect.\n"
+        "• If they don’t, you’ll receive an invite message + link that you can forward.\n"
+        "• You can have up to 15 friends connected.\n\n"
+        "4️⃣ Removing friends\n"
+        "• Use “👥 Friends → ➖ Remove”,\n"
+        "or send -@username directly in the chat.\n"
+        "• Removing a friend stops future link sharing, but past messages stay in their chat.\n\n"
+        "5️⃣ Pause / Resume\n"
+        "• Tap “⏸ Pause” to stop sending and receiving links.\n"
+        "• While paused, your friends’ links are stored for you.\n"
+        "• Tap “▶️ Resume” to become active again and get a summary of links you missed.\n\n"
+        "6️⃣ Wipe account\n"
+        "• Tap “🧹 Wipe Account” to delete your Kind Friends account, friendships,\n"
+        "and stored pending links.\n"
+        "• Already delivered messages in other chats can’t be removed.",
         reply_markup=help_keyboard(),
     )
 
