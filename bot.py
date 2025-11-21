@@ -1177,24 +1177,28 @@ async def admin_handler(message: types.Message):
     await message.answer(text, parse_mode="Markdown")
 
 
-@dp.message(F.text.startswith("/broadcast"))
+@dp.message(
+    F.text.startswith("/broadcast") | F.caption.startswith("/broadcast")
+)
 async def broadcast_handler(message: types.Message):
     """
-    Broadcast a text message to all registered users.
+    Broadcast a text message to all registered users, optionally with a photo.
     Only the configured ADMIN_ID can use this command.
     """
 
     if message.from_user.id != ADMIN_ID:
         return
 
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
+    command_payload = (message.text or message.caption or "").split(maxsplit=1)
+    if len(command_payload) < 2 or not command_payload[1].strip():
         await message.answer(
-            "Usage: /broadcast <message to send to all users>",
+            "Usage: /broadcast <message to send to all users>.\n"
+            "You can attach an image to send it with the message.",
         )
         return
 
-    broadcast_text = parts[1].strip()
+    broadcast_text = command_payload[1].strip()
+    photo_id = message.photo[-1].file_id if message.photo else None
     user_ids = await get_all_user_ids()
 
     delivered = 0
@@ -1202,7 +1206,10 @@ async def broadcast_handler(message: types.Message):
 
     for user_id in user_ids:
         try:
-            await bot.send_message(user_id, broadcast_text)
+            if photo_id:
+                await bot.send_photo(user_id, photo_id, caption=broadcast_text)
+            else:
+                await bot.send_message(user_id, broadcast_text)
             delivered += 1
         except Exception as e:  # noqa: BLE001
             print(f"[WARN] Failed to broadcast to {user_id}: {e}")
