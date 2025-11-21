@@ -12,6 +12,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 import asyncpg
 
 # -------------------------------------------------------------------
@@ -1220,54 +1221,45 @@ async def generic_handler(message: types.Message):
         )
 
 
-async def start_polling():
-    """
-    Start the bot in long polling mode after ensuring the database exists.
-    """
+async def on_startup(app):
+    """Initialize database and set webhook."""
+
+    print("Connecting to database...")
     await init_db()
-    await bot.delete_webhook(drop_pending_updates=True)
-    health_runner = await start_healthcheck_server()
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-        if health_runner:
-            await health_runner.cleanup()
-        print("Kind Friends bot stopped.")
+
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if not webhook_url:
+        raise RuntimeError("WEBHOOK_URL is not set")
+
+    await bot.set_webhook(webhook_url, drop_pending_updates=True)
+    print(f"Webhook set to {webhook_url}")
 
 
-async def start_healthcheck_server() -> web.AppRunner | None:
-    """
-    Start a minimal HTTP server if PORT is set (Render free Web Service).
-    Returns the runner so it can be cleaned up on shutdown.
-    """
-
-    port_value = os.getenv("PORT")
-    if not port_value:
-        return None
-
-    try:
-        port = int(port_value)
-    except ValueError:
-        print(f"[WARN] Invalid PORT value: {port_value}")
-        return None
-
-    app = web.Application()
-
-    async def health(_request: web.Request):
-        return web.Response(text="OK")
-
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"Healthcheck server listening on port {port}")
-    return runner
+async def on_shutdown(app):
+    await bot.session.close()
+    print("Kind Friends bot stopped.")
 
 
 def main():
-    asyncio.run(start_polling())
+    port = int(os.getenv("PORT", "10000"))
+
+    app = web.Application()
+
+    async def health(request: web.Request):
+        return web.Response(text="OK")
+
+    app.router.add_get("/", health)
+
+    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+    webhook_handler.register(app, path="/webhook")
+
+    setup_application(app, dp, bot=bot)
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    print(f"Aiohttp server running on 0.0.0.0:{port}")
+    web.run_app(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
