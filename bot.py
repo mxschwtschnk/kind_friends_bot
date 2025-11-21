@@ -27,6 +27,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "KindFriendsBot")  # without @
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram ID
 
 MAX_FRIENDS = 15
+MAX_DAILY_LINKS = 5
 
 feedback_recipient_raw = os.getenv("FEEDBACK_RECIPIENT_CHAT_ID")
 FEEDBACK_RECIPIENT_CHAT_ID = (
@@ -126,6 +127,18 @@ async def init_db():
             """
             ALTER TABLE users
             ADD COLUMN IF NOT EXISTS sent_links_count BIGINT NOT NULL DEFAULT 0;
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS sent_links_today_count INT NOT NULL DEFAULT 0;
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS sent_links_date DATE;
             """
         )
 
@@ -507,19 +520,65 @@ async def clear_pending_links_for_user(recipient_id: int):
         )
 
 
-async def increment_sent_links(tg_id: int):
+async def get_daily_sent_links_count(tg_id: int) -> int:
     """
-    Increase per-user counter of sent links.
+    Return how many links the user has sent today, resetting the counter if the day changed.
     """
+    today = datetime.now(timezone.utc).date()
     async with pool.acquire() as conn:
-        await conn.execute(
+        row = await conn.fetchrow(
             """
-            UPDATE users
-            SET sent_links_count = sent_links_count + 1
+            SELECT sent_links_today_count, sent_links_date
+            FROM users
             WHERE telegram_id = $1;
             """,
             tg_id,
         )
+
+        if not row:
+            return 0
+
+        count = row["sent_links_today_count"] or 0
+        last_date = row["sent_links_date"]
+
+        if last_date != today:
+            await conn.execute(
+                """
+                UPDATE users
+                SET sent_links_today_count = 0,
+                    sent_links_date = $1
+                WHERE telegram_id = $2;
+                """,
+                today,
+                tg_id,
+            )
+            return 0
+
+    return count
+
+
+async def increment_sent_links(tg_id: int) -> int:
+    """
+    Increase per-user counter of sent links.
+    """
+    today = datetime.now(timezone.utc).date()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE users
+            SET sent_links_count = sent_links_count + 1,
+                sent_links_today_count = CASE
+                    WHEN sent_links_date = $1 THEN sent_links_today_count + 1
+                    ELSE 1
+                END,
+                sent_links_date = $1
+            WHERE telegram_id = $2
+            RETURNING sent_links_today_count;
+            """,
+            today,
+            tg_id,
+        )
+    return row["sent_links_today_count"] if row else 0
 
 
 async def get_recent_sent_link_timestamp(sender_id: int, url: str):
@@ -1381,6 +1440,14 @@ async def generic_handler(message: types.Message):
                 )
                 return
 
+            daily_sent = await get_daily_sent_links_count(user_id)
+            if daily_sent >= MAX_DAILY_LINKS:
+                await message.answer(
+                    "You have reached the daily limit of 5 links.\n"
+                    "0/5 links are left for today.",
+                )
+                return
+
             friends_ids = await get_all_friend_ids(user_id)
             sender_username = message.from_user.username or "your friend"
             sent_count = 0
@@ -1401,13 +1468,17 @@ async def generic_handler(message: types.Message):
                     print(f"[WARN] Failed to deliver link to {fid}: {e}")
 
             # increment personal counter
-            await increment_sent_links(user_id)
+            new_daily_total = await increment_sent_links(user_id)
             await record_sent_link(user_id, text)
+
+            remaining_links = max(0, MAX_DAILY_LINKS - new_daily_total)
+            remaining_text = f"{remaining_links}/{MAX_DAILY_LINKS} links are left for today."
 
             if sent_count == 0 and stored_count == 0:
                 await message.answer(
                     "Got your link ✅\n"
-                    "Right now you don't have any friends to send it to."
+                    "Right now you don't have any friends to send it to.\n"
+                    f"{remaining_text}"
                 )
             else:
                 parts = ["Got your link ✅"]
@@ -1415,6 +1486,7 @@ async def generic_handler(message: types.Message):
                     parts.append(f"Sent to {sent_count} active friend(s).")
                 if stored_count:
                     parts.append(f"Saved for {stored_count} friend(s) who are on pause.")
+                parts.append(remaining_text)
                 await message.answer("\n".join(parts))
             return
 
