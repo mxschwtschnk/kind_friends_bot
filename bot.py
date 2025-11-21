@@ -406,6 +406,20 @@ async def get_pending_requests_for_requester(tg_id: int):
         )
 
 
+async def get_pending_requests_with_usernames_for_requester(tg_id: int):
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT p.id, p.recipient_telegram_id, u.username
+            FROM pending_friend_requests p
+            LEFT JOIN users u ON u.telegram_id = p.recipient_telegram_id
+            WHERE p.requester_telegram_id = $1
+            ORDER BY p.created_at DESC;
+            """,
+            tg_id,
+        )
+
+
 async def notify_user_friend_pool_full_with_pending(tg_id: int):
     friend_count = await get_friend_count(tg_id)
     pending_count = await count_pending_requests_for_requester(tg_id)
@@ -1015,6 +1029,7 @@ async def friends_handler(message: types.Message):
 
     friend_count = await get_friend_count(user_id)
     friends = await get_friend_usernames(user_id)
+    pending_requests = await get_pending_requests_with_usernames_for_requester(user_id)
     header = f"You have {friend_count}/{MAX_FRIENDS} friends.\n\n"
 
     if friends:
@@ -1022,6 +1037,14 @@ async def friends_handler(message: types.Message):
         text = header + "Your friends:\n" + "\n".join(lines)
     else:
         text = header + "You don't have any friends connected yet."
+
+    if pending_requests:
+        pending_usernames = [display_username(req["username"], "friend") for req in pending_requests]
+        pending_lines = [f"- {name}" for name in pending_usernames]
+        text += (
+            f"\n\n✉️ Pending invitations: {len(pending_requests)}\n"
+            + "\n".join(pending_lines)
+        )
 
     text += "\n\nChoose an option below."
     add_friend_mode.discard(user_id)
