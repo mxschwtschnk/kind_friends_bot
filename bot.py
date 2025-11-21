@@ -1039,10 +1039,16 @@ async def invite_friends_handler(message: types.Message):
     user_id = message.from_user.id
     add_friend_mode.add(user_id)
     remove_friend_mode.discard(user_id)
+    invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
     await message.answer(
-        "Send me your friend's Telegram @username (for example @username).\n"
-        "If they have not started Kind Friends yet, I will give you an invite link.",
+        "Send me your friend's Telegram @username.\n"
+        "If they have not started Kind Friends yet, here is an invite message you can forward right away:",
         reply_markup=back_only_keyboard(),
+    )
+    await message.answer(
+        "👋 I'm using Kind Friends to share interesting links with friends.\n\n"
+        f"I'd love to add you—open this link and press *Start* to join: {invite_link}",
+        parse_mode="Markdown",
     )
 
 
