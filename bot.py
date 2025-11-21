@@ -512,8 +512,7 @@ def display_username(username: str | None, fallback: str = "friend") -> str:
 def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
     if paused:
         keyboard = [
-            [KeyboardButton(text="▶️ Resume")],
-            [KeyboardButton(text="ℹ️ Help")],
+            [KeyboardButton(text="▶️ Resume"), KeyboardButton(text="ℹ️ Help")],
         ]
     else:
         keyboard = [
