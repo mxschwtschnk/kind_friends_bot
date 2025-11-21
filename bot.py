@@ -1047,8 +1047,10 @@ async def invite_friends_handler(message: types.Message):
         reply_markup=back_only_keyboard(),
     )
     await message.answer(
-        "👋 I'm using Kind Friends to share interesting links with friends.\n\n"
-        f"I'd love to add you—open this link and press <b>Start</b> to join: {invite_link}",
+        "👋 I use Kind Friends to share my links with friends so they can support me "
+        "with likes and comments whenever I post something new, and so I can support them "
+        "when they need it too.\n\n"
+        f"I'd love to add you! Open this link and press Start to join: {invite_link}",
         parse_mode="HTML",
     )
 
@@ -1466,8 +1468,10 @@ async def generic_handler(message: types.Message):
                     "I'll send you an invite message next that you can forward to them.",
                 )
                 await message.answer(
-                    "👋 I'm using Kind Friends to share interesting links with friends.\n\n"
-                    f"I'd love to add you—open this link and press *Start* to join: {invite_link}",
+                    "👋 I use Kind Friends to share my links with friends so they can support me "
+                    "with likes and comments whenever I post something new, and so I can support them "
+                    "when they need it too.\n\n"
+                    f"I'd love to add you! Open this link and press Start to join: {invite_link}",
                     parse_mode="Markdown",
                     reply_markup=friends_keyboard(),
                 )
