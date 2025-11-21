@@ -24,6 +24,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "KindFriendsBot")  # without @
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram ID
 
+MAX_FRIENDS = 15
+
 feedback_recipient_raw = os.getenv("FEEDBACK_RECIPIENT_CHAT_ID")
 FEEDBACK_RECIPIENT_CHAT_ID = (
     int(feedback_recipient_raw) if feedback_recipient_raw else ADMIN_ID
@@ -287,6 +289,18 @@ async def get_friend_usernames(tg_id: int):
     return [r["username"] for r in rows if r["username"]]
 
 
+async def get_friend_count(tg_id: int) -> int:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM friendships
+            WHERE user_telegram_id = $1;
+            """,
+            tg_id,
+        )
+
+
 async def get_all_friend_ids(tg_id: int):
     """
     Get telegram_ids of all friends (paused or not).
@@ -317,6 +331,44 @@ async def remove_friendship(a_tg_id: int, b_tg_id: int):
             a_tg_id,
             b_tg_id,
         )
+
+
+async def count_pending_requests_for_requester(tg_id: int) -> int:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM pending_friend_requests
+            WHERE requester_telegram_id = $1;
+            """,
+            tg_id,
+        )
+
+
+async def get_pending_requests_for_requester(tg_id: int):
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT id, recipient_telegram_id
+            FROM pending_friend_requests
+            WHERE requester_telegram_id = $1;
+            """,
+            tg_id,
+        )
+
+
+async def notify_user_friend_pool_full_with_pending(tg_id: int):
+    friend_count = await get_friend_count(tg_id)
+    pending_count = await count_pending_requests_for_requester(tg_id)
+    if friend_count >= MAX_FRIENDS and pending_count:
+        try:
+            await bot.send_message(
+                tg_id,
+                "Your friend pool is full. These outstanding invitations can no longer be accepted. "
+                "Please delete a friend and send a new invitation if you still want to connect.",
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] Failed to notify user {tg_id} about full friend pool: {e}")
 
 
 async def get_username_by_telegram_id(tg_id: int) -> str | None:
@@ -798,13 +850,15 @@ async def friends_handler(message: types.Message):
         )
         return
 
+    friend_count = await get_friend_count(user_id)
     friends = await get_friend_usernames(user_id)
+    header = f"You have {friend_count}/{MAX_FRIENDS} friends.\n\n"
 
     if friends:
         lines = [f"- @{u}" for u in friends]
-        text = "Your friends:\n" + "\n".join(lines)
+        text = header + "Your friends:\n" + "\n".join(lines)
     else:
-        text = "You don't have any friends connected yet."
+        text = header + "You don't have any friends connected yet."
 
     text += "\n\nChoose an option below."
     add_friend_mode.discard(user_id)
@@ -850,10 +904,42 @@ async def accept_friend_request(callback: types.CallbackQuery):
         await callback.answer("This request is for a different user.", show_alert=True)
         return
 
-    await delete_friend_request(request_id)
-    await add_mutual_friendship(request["requester_telegram_id"], request["recipient_telegram_id"])
+    requester_id = request["requester_telegram_id"]
+    recipient_id = request["recipient_telegram_id"]
 
-    requester_username = await get_username_by_telegram_id(request["requester_telegram_id"])
+    requester_friend_count = await get_friend_count(requester_id)
+    recipient_friend_count = await get_friend_count(recipient_id)
+
+    if requester_friend_count >= MAX_FRIENDS:
+        await delete_friend_request(request_id)
+        await callback.message.answer(
+            "Unfortunately it’s impossible to add this friend because their friend pool is full.",
+            reply_markup=friends_keyboard(),
+        )
+        await notify_user_friend_pool_full_with_pending(requester_id)
+        return
+
+    if recipient_friend_count >= MAX_FRIENDS:
+        await delete_friend_request(request_id)
+        await callback.message.answer(
+            "You already have 15 friends. Unfortunately there is a limit because it’s MVP, "
+            "and we’ll notify you when it will be possible to add more. For now you can "
+            "delete some friends from your list before sending new invitations.",
+            reply_markup=friends_keyboard(),
+        )
+        try:
+            await bot.send_message(
+                requester_id,
+                "Your invitation could not be accepted because your friend reached the 15 friend limit.",
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] Failed to notify requester {requester_id} about full pool: {e}")
+        return
+
+    await delete_friend_request(request_id)
+    await add_mutual_friendship(requester_id, recipient_id)
+
+    requester_username = await get_username_by_telegram_id(requester_id)
     recipient_username = await get_username_by_telegram_id(callback.from_user.id)
     requester_display = display_username(requester_username, "friend")
     recipient_display = display_username(recipient_username, "friend")
@@ -864,11 +950,14 @@ async def accept_friend_request(callback: types.CallbackQuery):
 
     try:
         await bot.send_message(
-            request["requester_telegram_id"],
+            requester_id,
             f"{recipient_display} accepted your invitation. You're now friends!",
         )
     except Exception as e:
-        print(f"[WARN] Failed to notify requester {request['requester_telegram_id']}: {e}")
+        print(f"[WARN] Failed to notify requester {requester_id}: {e}")
+
+    await notify_user_friend_pool_full_with_pending(requester_id)
+    await notify_user_friend_pool_full_with_pending(recipient_id)
 
     await callback.answer("Friendship confirmed!")
 
@@ -1020,6 +1109,16 @@ async def generic_handler(message: types.Message):
             add_friend_mode.discard(user_id)
             friend_username_raw = text.strip()
 
+            friend_count = await get_friend_count(user_id)
+            if friend_count >= MAX_FRIENDS:
+                await message.answer(
+                    "You already have 15 friends. Unfortunately there is a limit because it’s MVP, "
+                    "and we’ll notify you when it will be possible to add more. For now you can "
+                    "delete some friends from your list before sending new invitations.",
+                    reply_markup=friends_keyboard(),
+                )
+                return
+
             friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
             clean_username = friend_username_raw.lstrip("@")
 
@@ -1052,6 +1151,14 @@ async def generic_handler(message: types.Message):
                 )
                 return
 
+            friend_friend_count = await get_friend_count(friend_tg_id)
+            if friend_friend_count >= MAX_FRIENDS:
+                await message.answer(
+                    "Unfortunately it’s not possible to add this friend because their friend pool is full.",
+                    reply_markup=friends_keyboard(),
+                )
+                return
+
             outgoing_request = await get_pending_friend_request(user_id, friend_tg_id)
             if outgoing_request:
                 await message.answer(
@@ -1062,6 +1169,32 @@ async def generic_handler(message: types.Message):
 
             incoming_request = await get_pending_friend_request(friend_tg_id, user_id)
             if incoming_request:
+                if friend_count >= MAX_FRIENDS:
+                    await delete_friend_request(incoming_request["id"])
+                    await message.answer(
+                        "You already have 15 friends. Unfortunately there is a limit because it’s MVP, "
+                        "and we’ll notify you when it will be possible to add more. For now you can "
+                        "delete some friends from your list before sending new invitations.",
+                        reply_markup=friends_keyboard(),
+                    )
+                    return
+
+                if friend_friend_count >= MAX_FRIENDS:
+                    await delete_friend_request(incoming_request["id"])
+                    await message.answer(
+                        "Unfortunately it’s impossible to add this friend because their friend pool is full.",
+                        reply_markup=friends_keyboard(),
+                    )
+                    try:
+                        await bot.send_message(
+                            friend_tg_id,
+                            "Someone tried to accept your invitation, but your friend pool is full. "
+                            "Please remove a friend and send a new invitation.",
+                        )
+                    except Exception as e:
+                        print(f"[WARN] Failed to notify friend {friend_tg_id}: {e}")
+                    return
+
                 await delete_friend_request(incoming_request["id"])
                 await add_mutual_friendship(user_id, friend_tg_id)
 
@@ -1080,6 +1213,8 @@ async def generic_handler(message: types.Message):
                     )
                 except Exception as e:
                     print(f"[WARN] Failed to notify friend {friend_tg_id}: {e}")
+                await notify_user_friend_pool_full_with_pending(user_id)
+                await notify_user_friend_pool_full_with_pending(friend_tg_id)
                 return
 
             request_id = await create_friend_request(user_id, friend_tg_id)
@@ -1092,8 +1227,16 @@ async def generic_handler(message: types.Message):
 
             friend_username = await get_username_by_telegram_id(friend_tg_id)
             friend_display = display_username(friend_username or clean_username, "friend")
+            pending_after_request = await count_pending_requests_for_requester(user_id)
+            total_connections = friend_count + pending_after_request
+            extra_hint = (
+                "\n\nYou have already sent more than 15 invitations in total. Not all of them can be accepted "
+                "because of the current 15 friend limit."
+                if total_connections > MAX_FRIENDS
+                else ""
+            )
             await message.answer(
-                f"Request sent to {friend_display}. Waiting for confirmation.",
+                f"Request sent to {friend_display}. Waiting for confirmation.{extra_hint}",
                 reply_markup=friends_keyboard(),
             )
 
