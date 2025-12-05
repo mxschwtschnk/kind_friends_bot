@@ -1,2 +1,18 @@
 scripts/start_codespace.sh
 .venv/
+# Dev / Codespaces
+scripts/start_codespace.sh
+
+# Локальные переменные и окружение
+.env
+.env.*
+.venv/
+
+# Python мусор
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE/OS
+.vscode/
+.DS_Store
