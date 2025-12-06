@@ -41,6 +41,23 @@ FLOW_REMOVE_FRIEND = "remove_friend"
 FLOW_FEEDBACK = "feedback"
 FLOW_DELETE_ACCOUNT = "delete_account_confirmation"
 
+# Text labels for reply-keyboard buttons so we can exclude them from the
+# generic catch-all handler. This keeps button presses routed only through
+# their dedicated handlers.
+MENU_BUTTON_TEXTS = {
+    "Start",
+    "ℹ️ Help",
+    "📖 How to",
+    "🧹 Wipe Account",
+    "💬 Feedback",
+    "⬅️ Back",
+    "⏸ Pause",
+    "▶️ Resume",
+    "👥 Friends",
+    "➕ Invite",
+    "➖ Remove",
+}
+
 bot = Bot(token=settings.bot_token)
 dp = Dispatcher()
 
@@ -1438,7 +1455,7 @@ register_admin_handlers(
     generic_handler=generic_handler,
 )
 
-dp.message.register(generic_handler)
+dp.message.register(generic_handler, ~F.text.in_(MENU_BUTTON_TEXTS))
 
 
 async def on_startup(app):
