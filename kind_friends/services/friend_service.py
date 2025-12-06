@@ -14,7 +14,13 @@ def display_username(username: str | None, fallback: str = "friend") -> str:
 
 
 def get_max_friends(settings: Settings, user_id: int) -> int:
-    return settings.admin_max_friends if user_id == settings.admin_id else settings.max_friends
+    if user_id == settings.admin_id:
+        return settings.admin_max_friends
+
+    if settings.alpha_users and user_id in settings.alpha_users:
+        return settings.alpha_users_max_friends
+
+    return settings.max_friends
 
 
 @dataclass
