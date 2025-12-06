@@ -35,7 +35,7 @@ def load_settings() -> Settings:
     bot_token = os.getenv("BOT_TOKEN")
     database_url = os.getenv("DATABASE_URL")
     bot_username = os.getenv("BOT_USERNAME", "KindFriendsBot")
-    admin_id = int(os.getenv("ADMIN_ID", "0"))
+    admin_id = _get_required_int_env("ADMIN_ID")
     max_friends = _get_required_int_env("MAX_FRIENDS")
     admin_max_friends = _get_required_int_env("ADMIN_MAX_FRIENDS")
     max_daily_links = _get_required_int_env("MAX_DAILY_LINKS")
