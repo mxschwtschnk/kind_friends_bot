@@ -1074,7 +1074,6 @@ async def wipe_me_handler(message: types.Message):
     )
 
 
-@dp.message()
 async def generic_handler(message: types.Message):
     """
     Generic handler:
@@ -1435,6 +1434,8 @@ register_admin_handlers(
     database=database,
     generic_handler=generic_handler,
 )
+
+dp.message.register(generic_handler)
 
 
 async def on_startup(app):
