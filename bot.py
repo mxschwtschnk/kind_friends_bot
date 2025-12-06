@@ -509,12 +509,7 @@ def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
         ]
     else:
         keyboard = [
-            [
-                KeyboardButton(text="👥 Friends"),
-                KeyboardButton(text="❤️ Love"),
-                KeyboardButton(text="🎁 Wishlists"),
-                KeyboardButton(text="💼 Work"),
-            ],
+            [KeyboardButton(text="👥 Friends")],
             [KeyboardButton(text="⏸ Pause"), KeyboardButton(text="ℹ️ Help")],
         ]
 
@@ -865,29 +860,6 @@ async def friends_handler(message: types.Message):
     add_friend_mode.discard(user_id)
     remove_friend_mode.discard(user_id)
     await message.answer(text, parse_mode="Markdown", reply_markup=friends_keyboard())
-
-
-async def _coming_soon_reply(message: types.Message, feature_name: str):
-    paused = await is_paused(message.from_user.id)
-    await message.answer(
-        f"{feature_name} is coming soon. Stay tuned!",
-        reply_markup=main_keyboard(paused),
-    )
-
-
-@dp.message(F.text == "❤️ Love")
-async def love_handler(message: types.Message):
-    await _coming_soon_reply(message, "Love")
-
-
-@dp.message(F.text == "🎁 Wishlists")
-async def wishlists_handler(message: types.Message):
-    await _coming_soon_reply(message, "Wishlists")
-
-
-@dp.message(F.text == "💼 Work")
-async def work_handler(message: types.Message):
-    await _coming_soon_reply(message, "Work")
 
 
 @dp.message(F.text == "➖ Remove")
