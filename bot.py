@@ -710,7 +710,7 @@ async def how_to_handler(message: types.Message):
 @dp.message(F.text == "🧹 Wipe Account")
 async def delete_account_prompt(message: types.Message):
     user_id = message.from_user.id
-    await session_store.set_flow(user_id, FLOW_DELETE_ACCOUNT)
+    await session_store.set_flow(user_id, FLOW_DELETE_ACCOUNT, username=message.from_user.username)
     await message.answer(
         "Are you sure you want to wipe your Kind Friends account?\n\n"
         "This will remove all friends, delete any stored pending links, and new links will no longer arrive.\n"
@@ -726,7 +726,9 @@ async def delete_account_prompt(message: types.Message):
 
 @dp.message(F.text == "💬 Feedback")
 async def start_feedback_from_menu(message: types.Message):
-    await session_store.set_flow(message.from_user.id, FLOW_FEEDBACK)
+    await session_store.set_flow(
+        message.from_user.id, FLOW_FEEDBACK, username=message.from_user.username
+    )
     await message.answer(
         "Thanks for willing to share feedback!\nSend your thoughts in one message and I'll pass it along.",
         reply_markup=feedback_keyboard(),
@@ -809,7 +811,7 @@ async def resume_handler(message: types.Message):
 @dp.message(F.text == "➕ Invite")
 async def invite_friends_handler(message: types.Message):
     user_id = message.from_user.id
-    await session_store.set_flow(user_id, FLOW_ADD_FRIEND)
+    await session_store.set_flow(user_id, FLOW_ADD_FRIEND, username=message.from_user.username)
     invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
     await message.answer(
         "Send me your friend's Telegram @username.\n"
@@ -872,7 +874,7 @@ async def remove_friend_handler(message: types.Message):
         )
         return
 
-    await session_store.set_flow(user_id, FLOW_REMOVE_FRIEND)
+    await session_store.set_flow(user_id, FLOW_REMOVE_FRIEND, username=message.from_user.username)
     await message.answer(
         "You can now delete your friends from the list.\n"
         "Choose one or a few by clicking on the tags below.",
@@ -1048,7 +1050,9 @@ async def decline_friend_request(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "start_feedback")
 async def start_feedback(callback: types.CallbackQuery):
-    await session_store.set_flow(callback.from_user.id, FLOW_FEEDBACK)
+    await session_store.set_flow(
+        callback.from_user.id, FLOW_FEEDBACK, username=callback.from_user.username
+    )
     await callback.message.answer(
         "Thanks for willing to share feedback!\n"
         "Send your thoughts in one message and I'll pass it along.",

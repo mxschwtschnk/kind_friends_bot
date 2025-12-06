@@ -22,9 +22,21 @@ class SessionStore:
     def __init__(self, database: Database):
         self.database = database
 
-    async def set_flow(self, user_id: int, flow: str, metadata: dict[str, Any] | None = None):
-        """Set the user's current flow with optional metadata."""
+    async def set_flow(
+        self,
+        user_id: int,
+        flow: str,
+        metadata: dict[str, Any] | None = None,
+        username: str | None = None,
+    ):
+        """Set the user's current flow with optional metadata.
 
+        Ensures the user record exists to satisfy the foreign key constraint
+        on ``session_states``. This lets the session store be used safely even
+        if the user interacts before ``/start`` initializes their record.
+        """
+
+        await self.database.get_or_create_user(user_id, username)
         await self.database.set_session_state(user_id, flow, metadata or {})
 
     async def clear_flow(self, user_id: int):
