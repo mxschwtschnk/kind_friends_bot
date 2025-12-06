@@ -1102,6 +1102,10 @@ async def generic_handler(message: types.Message):
     """
     user_id = message.from_user.id
     text = message.text or ""
+
+    # Skip menu button presses so their dedicated handlers can respond
+    if text in MENU_BUTTON_TEXTS:
+        return
     user_paused = await is_paused(user_id)
 
     async with LoadingIndicator(message):
@@ -1455,7 +1459,13 @@ register_admin_handlers(
     generic_handler=generic_handler,
 )
 
-dp.message.register(generic_handler, ~F.text.in_(MENU_BUTTON_TEXTS))
+# Exclude menu button presses from the generic catch-all so their dedicated
+# handlers can run. This prevents buttons from being swallowed if the
+# dispatcher stops after the first matched handler.
+dp.message.register(
+    generic_handler,
+    F.text.func(lambda text: text not in MENU_BUTTON_TEXTS),
+)
 
 
 async def on_startup(app):
