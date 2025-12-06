@@ -12,7 +12,7 @@ class Settings:
     max_friends: int
     admin_max_friends: int
     max_daily_links: int
-    alpha_users: list[int] | None
+    alpha_users: list[int]
     alpha_users_max_friends: int
 
 
