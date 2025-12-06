@@ -4,6 +4,7 @@ import math
 
 import asyncio
 from aiohttp import web
+import asyncpg
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -15,35 +16,67 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-import asyncpg
 
-# -------------------------------------------------------------------
-# CONFIG
-# -------------------------------------------------------------------
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "KindFriendsBot")  # without @
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram ID
-
-MAX_FRIENDS = 15
-ADMIN_MAX_FRIENDS = 50
-MAX_DAILY_LINKS = 5
-
-feedback_recipient_raw = os.getenv("FEEDBACK_RECIPIENT_CHAT_ID")
-FEEDBACK_RECIPIENT_CHAT_ID = (
-    int(feedback_recipient_raw) if feedback_recipient_raw else ADMIN_ID
+from kind_friends.config import load_settings
+from kind_friends.repositories import Database
+from kind_friends.services.friend_service import (
+    FriendInviteDecision,
+    FriendService,
+    display_username,
+    get_max_friends,
+    normalize_username_input,
 )
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+settings = load_settings()
 
-bot = Bot(token=BOT_TOKEN)
+BOT_USERNAME = settings.bot_username  # without @
+MAX_DAILY_LINKS = settings.max_daily_links
+ADMIN_ID = settings.admin_id
+FEEDBACK_RECIPIENT_CHAT_ID = settings.feedback_recipient_chat_id
+
+bot = Bot(token=settings.bot_token)
 dp = Dispatcher()
 
-pool: asyncpg.Pool | None = None
+database = Database(settings.database_url)
+friend_service = FriendService(database, settings)
+
+pool = database.pool
+
+get_or_create_user = database.get_or_create_user
+set_pause = database.set_pause
+is_paused = database.is_paused
+get_telegram_id_by_username = database.get_telegram_id_by_username
+add_mutual_friendship = database.add_mutual_friendship
+get_friend_usernames = database.get_friend_usernames
+get_friend_count = database.get_friend_count
+get_all_friend_ids = database.get_all_friend_ids
+remove_friendship = database.remove_friendship
+count_pending_requests_for_requester = database.count_pending_requests_for_requester
+get_pending_requests_for_requester = database.get_pending_requests_for_requester
+get_pending_requests_with_usernames_for_requester = (
+    database.get_pending_requests_with_usernames_for_requester
+)
+get_username_by_telegram_id = database.get_username_by_telegram_id
+get_all_user_ids = database.get_all_user_ids
+get_pending_friend_request = database.get_pending_friend_request
+create_friend_request = database.create_friend_request
+get_friend_request_by_id = database.get_friend_request_by_id
+delete_friend_request = database.delete_friend_request
+delete_friend_requests_for_user = database.delete_friend_requests_for_user
+save_pending_link = database.save_pending_link
+get_pending_links = database.get_pending_links
+delete_pending_link = database.delete_pending_link
+delete_pending_links_for_user = database.delete_pending_links_for_user
+increment_sent_links = database.increment_sent_links
+get_sent_link_counts = database.get_sent_link_counts
+save_sent_link_history = database.save_sent_link_history
+has_recently_sent_link = database.has_recently_sent_link
+delete_sent_link_history_for_user = database.delete_sent_link_history_for_user
+delete_user_completely = database.delete_user_completely
+increment_invite_count = database.increment_invite_count
+get_invite_count = database.get_invite_count
+clear_sent_links = database.clear_sent_links
+bulk_delete_users = database.bulk_delete_users
 add_friend_mode = set()  # user_ids who are adding a friend
 remove_friend_mode = set()  # user_ids who are removing a friend
 feedback_mode = set()  # user_ids who are sending feedback
@@ -107,265 +140,8 @@ async def init_db():
     Create connection pool and required tables.
     """
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL)
-
-    async with pool.acquire() as conn:
-        # Users table
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE NOT NULL,
-                username TEXT,
-                is_paused BOOLEAN NOT NULL DEFAULT FALSE,
-                sent_links_count BIGINT NOT NULL DEFAULT 0,
-                invites_sent_count BIGINT NOT NULL DEFAULT 0,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """
-        )
-        # Ensure sent_links_count exists for older schema
-        await conn.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS sent_links_count BIGINT NOT NULL DEFAULT 0;
-            """
-        )
-        await conn.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS invites_sent_count BIGINT NOT NULL DEFAULT 0;
-            """
-        )
-        await conn.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS sent_links_today_count INT NOT NULL DEFAULT 0;
-            """
-        )
-        await conn.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS sent_links_date DATE;
-            """
-        )
-
-        # Friendships table
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS friendships (
-                id SERIAL PRIMARY KEY,
-                user_telegram_id BIGINT NOT NULL,
-                friend_telegram_id BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (user_telegram_id, friend_telegram_id)
-            );
-            """
-        )
-
-        # Friend requests awaiting confirmation
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_friend_requests (
-                id SERIAL PRIMARY KEY,
-                requester_telegram_id BIGINT NOT NULL,
-                recipient_telegram_id BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (requester_telegram_id, recipient_telegram_id)
-            );
-            """
-        )
-
-        # Pending links for paused users
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_links (
-                id SERIAL PRIMARY KEY,
-                recipient_telegram_id BIGINT NOT NULL,
-                sender_telegram_id BIGINT NOT NULL,
-                url TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """
-        )
-
-        # Track when users last sent a specific link (spam control)
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sent_links_history (
-                sender_telegram_id BIGINT NOT NULL,
-                url TEXT NOT NULL,
-                sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (sender_telegram_id, url)
-            );
-            """
-        )
-
-
-# -------------------------------------------------------------------
-# DATABASE HELPERS
-# -------------------------------------------------------------------
-
-async def get_or_create_user(tg_id: int, username: str | None) -> bool:
-    """
-    Make sure user exists; always keep username fresh.
-    Return current is_paused flag.
-    """
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, is_paused FROM users WHERE telegram_id=$1",
-            tg_id,
-        )
-        if row:
-            await conn.execute(
-                "UPDATE users SET username=$1 WHERE telegram_id=$2",
-                username,
-                tg_id,
-            )
-            return row["is_paused"]
-
-        await conn.execute(
-            "INSERT INTO users (telegram_id, username) VALUES ($1, $2)",
-            tg_id,
-            username,
-        )
-        return False
-
-
-async def set_pause(tg_id: int, paused: bool):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id FROM users WHERE telegram_id=$1",
-            tg_id,
-        )
-        if row:
-            await conn.execute(
-                "UPDATE users SET is_paused=$1 WHERE telegram_id=$2",
-                paused,
-                tg_id,
-            )
-        else:
-            await conn.execute(
-                "INSERT INTO users (telegram_id, is_paused) VALUES ($1, $2)",
-                tg_id,
-                paused,
-            )
-
-
-async def is_paused(tg_id: int) -> bool:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT is_paused FROM users WHERE telegram_id=$1",
-            tg_id,
-        )
-    return row["is_paused"] if row else False
-
-
-async def get_telegram_id_by_username(username: str | None):
-    """
-    Find telegram_id by @username (case-insensitive).
-    """
-    if not username:
-        return None
-    username = username.lstrip("@").strip().lower()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT telegram_id FROM users WHERE LOWER(username)=$1",
-            username,
-        )
-    return row["telegram_id"] if row else None
-
-
-def normalize_username_input(raw: str) -> str:
-    """Strip formatting characters users might copy from lists."""
-    return raw.strip().lstrip("-").lstrip("@").strip()
-
-
-async def add_mutual_friendship(a_tg_id: int, b_tg_id: int):
-    """
-    Make friendship A<->B in both directions.
-    """
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO friendships (user_telegram_id, friend_telegram_id)
-            VALUES ($1, $2)
-            ON CONFLICT (user_telegram_id, friend_telegram_id) DO NOTHING;
-            """,
-            a_tg_id,
-            b_tg_id,
-        )
-        await conn.execute(
-            """
-            INSERT INTO friendships (user_telegram_id, friend_telegram_id)
-            VALUES ($1, $2)
-            ON CONFLICT (user_telegram_id, friend_telegram_id) DO NOTHING;
-            """,
-            b_tg_id,
-            a_tg_id,
-        )
-
-
-async def get_friend_usernames(tg_id: int):
-    """
-    Return list of friends' usernames for display.
-    """
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT u.username
-            FROM friendships f
-            JOIN users u ON u.telegram_id = f.friend_telegram_id
-            WHERE f.user_telegram_id = $1
-            ORDER BY u.username;
-            """,
-            tg_id,
-        )
-    return [r["username"] for r in rows if r["username"]]
-
-
-async def get_friend_count(tg_id: int) -> int:
-    async with pool.acquire() as conn:
-        return await conn.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM friendships
-            WHERE user_telegram_id = $1;
-            """,
-            tg_id,
-        )
-
-
-async def get_all_friend_ids(tg_id: int):
-    """
-    Get telegram_ids of all friends (paused or not).
-    """
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT friend_telegram_id
-            FROM friendships
-            WHERE user_telegram_id = $1;
-            """,
-            tg_id,
-        )
-    return [r["friend_telegram_id"] for r in rows]
-
-
-async def remove_friendship(a_tg_id: int, b_tg_id: int):
-    """
-    Remove friendship A-B and B-A.
-    """
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            DELETE FROM friendships
-            WHERE (user_telegram_id=$1 AND friend_telegram_id=$2)
-               OR (user_telegram_id=$2 AND friend_telegram_id=$1);
-            """,
-            a_tg_id,
-            b_tg_id,
-        )
+    await database.connect()
+    pool = database.pool
 
 
 async def notify_friend_removed(remover_id: int, friend_id: int):
@@ -424,7 +200,7 @@ async def get_pending_requests_with_usernames_for_requester(tg_id: int):
 async def notify_user_friend_pool_full_with_pending(tg_id: int):
     friend_count = await get_friend_count(tg_id)
     pending_count = await count_pending_requests_for_requester(tg_id)
-    max_friends = get_max_friends(tg_id)
+    max_friends = get_max_friends(settings, tg_id)
     if friend_count >= max_friends and pending_count:
         try:
             await bot.send_message(
@@ -449,12 +225,6 @@ async def get_all_user_ids() -> list[int]:
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT telegram_id FROM users;")
     return [row["telegram_id"] for row in rows]
-
-
-def get_max_friends(user_id: int) -> int:
-    return ADMIN_MAX_FRIENDS if user_id == ADMIN_ID else MAX_FRIENDS
-
-
 async def get_pending_friend_request(
     requester_id: int, recipient_id: int
 ) -> asyncpg.Record | None:
@@ -1068,7 +838,7 @@ async def friends_handler(message: types.Message):
     friend_count = await get_friend_count(user_id)
     friends = await get_friend_usernames(user_id)
     pending_requests = await get_pending_requests_with_usernames_for_requester(user_id)
-    max_friends = get_max_friends(user_id)
+    max_friends = get_max_friends(settings, user_id)
     header = f"You have {friend_count}/{max_friends} friends.\n\n"
 
     if friends:
@@ -1189,8 +959,8 @@ async def accept_friend_request(callback: types.CallbackQuery):
 
     requester_friend_count = await get_friend_count(requester_id)
     recipient_friend_count = await get_friend_count(recipient_id)
-    requester_max_friends = get_max_friends(requester_id)
-    recipient_max_friends = get_max_friends(recipient_id)
+    requester_max_friends = get_max_friends(settings, requester_id)
+    recipient_max_friends = get_max_friends(settings, recipient_id)
 
     if requester_friend_count >= requester_max_friends:
         await delete_friend_request(request_id)
@@ -1447,7 +1217,7 @@ async def generic_handler(message: types.Message):
             friend_username_raw = text.strip()
 
             friend_count = await get_friend_count(user_id)
-            max_friends = get_max_friends(user_id)
+            max_friends = get_max_friends(settings, user_id)
             if friend_count >= max_friends:
                 await message.answer(
                     f"You already have {max_friends} friends. Unfortunately there is a limit because it’s MVP, "
@@ -1493,7 +1263,7 @@ async def generic_handler(message: types.Message):
                 return
 
             friend_friend_count = await get_friend_count(friend_tg_id)
-            friend_limit_for_friend = get_max_friends(friend_tg_id)
+            friend_limit_for_friend = get_max_friends(settings, friend_tg_id)
             if friend_friend_count >= friend_limit_for_friend:
                 await message.answer(
                     "Unfortunately it’s not possible to add this friend because their friend pool is full.",
@@ -1511,7 +1281,7 @@ async def generic_handler(message: types.Message):
 
             incoming_request = await get_pending_friend_request(friend_tg_id, user_id)
             if incoming_request:
-                friend_max_friends = get_max_friends(user_id)
+                friend_max_friends = get_max_friends(settings, user_id)
                 if friend_count >= friend_max_friends:
                     await delete_friend_request(incoming_request["id"])
                     await message.answer(
