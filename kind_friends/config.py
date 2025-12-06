@@ -9,11 +9,11 @@ class Settings:
     bot_username: str
     admin_id: int
     feedback_recipient_chat_id: int
-    max_friends: int
-    admin_max_friends: int
-    max_daily_links: int
-    alpha_users: list[int]
-    alpha_users_max_friends: int
+    max_friends: int = 15
+    admin_max_friends: int = 50
+    max_daily_links: int = 5
+    alpha_users: list[int] | None = None
+    alpha_users_max_friends: int = 50
 
 
 class SettingsLoaderError(RuntimeError):
@@ -35,7 +35,7 @@ def load_settings() -> Settings:
     bot_token = os.getenv("BOT_TOKEN")
     database_url = os.getenv("DATABASE_URL")
     bot_username = os.getenv("BOT_USERNAME", "KindFriendsBot")
-    admin_id = _get_required_int_env("ADMIN_ID")
+    admin_id = int(os.getenv("ADMIN_ID", "0"))
     max_friends = _get_required_int_env("MAX_FRIENDS")
     admin_max_friends = _get_required_int_env("ADMIN_MAX_FRIENDS")
     max_daily_links = _get_required_int_env("MAX_DAILY_LINKS")
