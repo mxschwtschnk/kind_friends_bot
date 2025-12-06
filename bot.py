@@ -78,10 +78,15 @@ increment_invite_count = database.increment_invite_count
 get_invite_count = database.get_invite_count
 clear_sent_links = database.clear_sent_links
 bulk_delete_users = database.bulk_delete_users
+add_wishlist_item = database.add_wishlist_item
+get_wishlist_items = database.get_wishlist_items
+get_wishlist_item = database.get_wishlist_item
+delete_wishlist_item = database.delete_wishlist_item
 add_friend_mode = set()  # user_ids who are adding a friend
 remove_friend_mode = set()  # user_ids who are removing a friend
 feedback_mode = set()  # user_ids who are sending feedback
 delete_account_confirmation = set()  # user_ids awaiting delete confirmation
+wishlist_add_mode = set()  # user_ids adding wishlist entries
 
 
 class LoadingIndicator:
@@ -505,11 +510,12 @@ def display_username(username: str | None, fallback: str = "friend") -> str:
 def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
     if paused:
         keyboard = [
+            [KeyboardButton(text="👥 Friends"), KeyboardButton(text="📜 Wishlist")],
             [KeyboardButton(text="▶️ Resume"), KeyboardButton(text="ℹ️ Help")],
         ]
     else:
         keyboard = [
-            [KeyboardButton(text="👥 Friends")],
+            [KeyboardButton(text="👥 Friends"), KeyboardButton(text="📜 Wishlist")],
             [KeyboardButton(text="⏸ Pause"), KeyboardButton(text="ℹ️ Help")],
         ]
 
@@ -559,6 +565,62 @@ def remove_friends_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
         for username in friends
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def wishlist_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Add link"), KeyboardButton(text="✏️ Edit")],
+            [KeyboardButton(text="⬅️ Back")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def friend_list_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"@{username}", callback_data=f"friend_card:{username}")]
+        for username in friends
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def friend_options_keyboard(username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Remove", callback_data=f"friend_remove:{username}")],
+            [InlineKeyboardButton(text="📜 Wishlist", callback_data=f"friend_wishlist:{username}")],
+        ]
+    )
+
+
+def _shorten_url(url: str, max_length: int = 32) -> str:
+    trimmed = url.removeprefix("https://").removeprefix("http://")
+    if len(trimmed) <= max_length:
+        return trimmed
+    return trimmed[: max_length - 1] + "…"
+
+
+def wishlist_items_keyboard(items, editable: bool) -> InlineKeyboardMarkup:
+    buttons = []
+    for item in items:
+        label = _shorten_url(item["url"])
+        if editable:
+            buttons.append(
+                [InlineKeyboardButton(text=label, callback_data=f"wishlist_item:{item['id']}")]
+            )
+        else:
+            buttons.append([InlineKeyboardButton(text=label, url=item["url"])])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def wishlist_item_action_keyboard(item) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🌐 Open item", url=item["url"])],
+            [InlineKeyboardButton(text="🗑 Delete", callback_data=f"wishlist_delete:{item['id']}")],
+        ]
+    )
 
 
 # -------------------------------------------------------------------
@@ -672,6 +734,49 @@ async def help_handler(message: types.Message):
     )
 
 
+async def send_editable_wishlist(message: types.Message, user_id: int):
+    items = await get_wishlist_items(user_id)
+    if not items:
+        await message.answer(
+            "Your wishlist is empty right now. Tap ➕ Add link to save one.",
+            reply_markup=wishlist_keyboard(),
+        )
+        return
+
+    await message.answer(
+        "Your wishlist items are below. Tap one to open or delete it.",
+        reply_markup=wishlist_keyboard(),
+    )
+    await message.answer(
+        "Wishlist:",
+        reply_markup=wishlist_items_keyboard(items, editable=True),
+    )
+
+
+@dp.message(F.text == "📜 Wishlist")
+async def wishlist_menu(message: types.Message):
+    wishlist_add_mode.discard(message.from_user.id)
+    await message.answer(
+        "Manage your wishlist. Choose an option below.",
+        reply_markup=wishlist_keyboard(),
+    )
+
+
+@dp.message(F.text == "➕ Add link")
+async def wishlist_add_prompt(message: types.Message):
+    user_id = message.from_user.id
+    wishlist_add_mode.add(user_id)
+    await message.answer(
+        "Send me a link to add to your wishlist.",
+        reply_markup=wishlist_keyboard(),
+    )
+
+
+@dp.message(F.text == "✏️ Edit")
+async def wishlist_edit(message: types.Message):
+    await send_editable_wishlist(message, message.from_user.id)
+
+
 @dp.message(F.text == "📖 How to")
 async def how_to_handler(message: types.Message):
     await message.answer(
@@ -737,6 +842,7 @@ async def back_to_main(message: types.Message):
     remove_friend_mode.discard(message.from_user.id)
     feedback_mode.discard(message.from_user.id)
     delete_account_confirmation.discard(message.from_user.id)
+    wishlist_add_mode.discard(message.from_user.id)
     await message.answer(
         "Back to the main menu.",
         reply_markup=main_keyboard(user_paused),
@@ -861,6 +967,12 @@ async def friends_handler(message: types.Message):
     remove_friend_mode.discard(user_id)
     await message.answer(text, parse_mode="Markdown", reply_markup=friends_keyboard())
 
+    if friends:
+        await message.answer(
+            "Tap a friend to open their actions:",
+            reply_markup=friend_list_keyboard(friends),
+        )
+
 
 @dp.message(F.text == "➖ Remove")
 async def remove_friend_handler(message: types.Message):
@@ -936,6 +1048,123 @@ async def remove_friend_callback(callback: types.CallbackQuery):
             "Friend list is empty now. Returning to Friends menu.",
             reply_markup=friends_keyboard(),
         )
+
+
+@dp.callback_query(F.data.startswith("wishlist_item:"))
+async def wishlist_item_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    item = await get_wishlist_item(item_id)
+    if not item or item["owner_telegram_id"] != callback.from_user.id:
+        await callback.answer("This wishlist item is no longer available.", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(
+        "What would you like to do with this wishlist item?",
+        reply_markup=wishlist_item_action_keyboard(item),
+    )
+
+
+@dp.callback_query(F.data.startswith("wishlist_delete:"))
+async def wishlist_delete_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    await delete_wishlist_item(callback.from_user.id, item_id)
+    await callback.answer("Wishlist item deleted.")
+    await send_editable_wishlist(callback.message, callback.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("friend_card:"))
+async def friend_card_callback(callback: types.CallbackQuery):
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid friend action.", show_alert=True)
+        return
+
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
+        return
+
+    friends_ids = await get_all_friend_ids(callback.from_user.id)
+    if friend_tg_id not in friends_ids:
+        await callback.answer("You are no longer connected with this friend.", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(
+        f"What do you want to do with @{friend_username_raw}?",
+        reply_markup=friend_options_keyboard(friend_username_raw),
+    )
+
+
+@dp.callback_query(F.data.startswith("friend_remove:"))
+async def friend_remove_from_card(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid friend action.", show_alert=True)
+        return
+
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
+        return
+
+    friends_ids = await get_all_friend_ids(user_id)
+    if friend_tg_id not in friends_ids:
+        await callback.answer("You are no longer connected with this friend.", show_alert=True)
+        return
+
+    await remove_friendship(user_id, friend_tg_id)
+    await notify_friend_removed(user_id, friend_tg_id)
+
+    await callback.answer("Friend removed.")
+    await callback.message.answer(
+        f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
+        reply_markup=friends_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("friend_wishlist:"))
+async def friend_wishlist_callback(callback: types.CallbackQuery):
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid friend action.", show_alert=True)
+        return
+
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
+        return
+
+    friends_ids = await get_all_friend_ids(callback.from_user.id)
+    if friend_tg_id not in friends_ids:
+        await callback.answer("You are no longer connected with this friend.", show_alert=True)
+        return
+
+    items = await get_wishlist_items(friend_tg_id)
+    if not items:
+        await callback.answer("This wishlist is empty right now.", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(
+        f"Wishlist for @{friend_username_raw}:",
+        reply_markup=wishlist_items_keyboard(items, editable=False),
+    )
 
 
 @dp.callback_query(F.data.startswith("friend_accept:"))
@@ -1132,6 +1361,24 @@ async def generic_handler(message: types.Message):
                     reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
                 )
                 return
+
+        # 0.2) Wishlist add mode
+        if user_id in wishlist_add_mode:
+            if not (text.startswith("http://") or text.startswith("https://")):
+                await message.answer(
+                    "Please send a full link starting with http:// or https:// to save it to your wishlist.",
+                    reply_markup=wishlist_keyboard(),
+                )
+                return
+
+            wishlist_add_mode.discard(user_id)
+            await add_wishlist_item(user_id, text.strip())
+            await message.answer(
+                "Saved to your wishlist ✅",
+                reply_markup=wishlist_keyboard(),
+            )
+            await send_editable_wishlist(message, user_id)
+            return
 
         # 1) Add friend mode
         if user_id in add_friend_mode and text.startswith("@"):
