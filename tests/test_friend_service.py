@@ -133,6 +133,11 @@ def test_reset_daily_links_clears_old_counts():
         bot_username="bot",
         admin_id=1,
         feedback_recipient_chat_id=1,
+        max_friends=15,
+        admin_max_friends=30,
+        max_daily_links=5,
+        alpha_users=[],
+        alpha_users_max_friends=25,
     )
     repo = RepoWithHistory()
     service = FriendService(repo, settings)
