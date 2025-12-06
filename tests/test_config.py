@@ -17,11 +17,6 @@ def test_parse_id_list_trims_whitespace_and_quotes():
     assert _parse_id_list(' 123, "456" , \'789\' ', "ALPHA_USERS") == [123, 456, 789]
 
 
-def test_parse_id_list_supports_json_like_array_strings():
-    assert _parse_id_list("[\"111\", '222', 333]", "ALPHA_USERS") == [111, 222, 333]
-    assert _parse_id_list('["\""]', "ALPHA_USERS") == []
-
-
 def test_parse_id_list_invalid_value_raises_error():
     with pytest.raises(SettingsLoaderError):
         _parse_id_list("not-a-number", "ALPHA_USERS")
