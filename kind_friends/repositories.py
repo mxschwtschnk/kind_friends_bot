@@ -78,6 +78,18 @@ class Database:
                 );
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_states (
+                    user_telegram_id BIGINT PRIMARY KEY,
+                    flow TEXT,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT fk_user FOREIGN KEY (user_telegram_id)
+                        REFERENCES users(telegram_id) ON DELETE CASCADE
+                );
+                """
+            )
 
     async def get_or_create_user(self, tg_id: int, username: str | None) -> bool:
         if not self.pool:
@@ -555,4 +567,59 @@ class Database:
             await conn.execute(
                 "DELETE FROM users WHERE telegram_id = ANY($1::bigint[]);",
                 ids,
+            )
+
+    async def set_session_state(self, tg_id: int, flow: str, metadata: dict):
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO session_states (user_telegram_id, flow, metadata, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (user_telegram_id) DO UPDATE
+                SET flow = EXCLUDED.flow,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW();
+                """,
+                tg_id,
+                flow,
+                metadata,
+            )
+
+    async def clear_session_state(self, tg_id: int):
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM session_states WHERE user_telegram_id = $1;",
+                tg_id,
+            )
+
+    async def get_session_state(self, tg_id: int) -> tuple[str | None, dict]:
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT flow, metadata FROM session_states WHERE user_telegram_id = $1;",
+                tg_id,
+            )
+        if not row:
+            return None, {}
+        return row["flow"], row["metadata"] or {}
+
+    async def update_session_metadata(self, tg_id: int, metadata: dict):
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO session_states (user_telegram_id, metadata)
+                VALUES ($1, $2)
+                ON CONFLICT (user_telegram_id) DO UPDATE
+                SET metadata = session_states.metadata || EXCLUDED.metadata,
+                    updated_at = NOW();
+                """,
+                tg_id,
+                metadata,
             )
