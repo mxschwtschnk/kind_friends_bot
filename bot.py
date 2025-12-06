@@ -26,6 +26,7 @@ from kind_friends.services.friend_service import (
     get_max_friends,
     normalize_username_input,
 )
+from admin_commands import register_admin_handlers
 
 settings = load_settings()
 
@@ -1059,84 +1060,6 @@ async def start_feedback(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.message(F.text == "/admin")
-async def admin_handler(message: types.Message):
-    """
-    Simple admin stats, available only for ADMIN_ID.
-    """
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    async with pool.acquire() as conn:
-        users_count = await conn.fetchval("SELECT COUNT(*) FROM users;")
-        paused_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE is_paused = TRUE;"
-        )
-        friendships_count = await conn.fetchval("SELECT COUNT(*) FROM friendships;")
-        pending_count = await conn.fetchval("SELECT COUNT(*) FROM pending_links;")
-        sent_links_total = await conn.fetchval(
-            "SELECT COALESCE(SUM(sent_links_count), 0) FROM users;"
-        )
-        invites_sent_total = await conn.fetchval(
-            "SELECT COALESCE(SUM(invites_sent_count), 0) FROM users;"
-        )
-
-    text = (
-        "📊 **Kind Friends — Admin Panel**\n\n"
-        f"👥 Total users: **{users_count}**\n"
-        f"⏸ Paused users: **{paused_count}**\n"
-        f"🔗 Friend connections: **{friendships_count}**\n"
-        f"📥 Pending links (stored for paused): **{pending_count}**\n"
-        f"📤 Total links sent attempts: **{sent_links_total}**\n"
-        f"✉️ Total invites sent: **{invites_sent_total}**\n"
-    )
-
-    await message.answer(text, parse_mode="Markdown")
-
-
-@dp.message(
-    F.text.startswith("/broadcast") | F.caption.startswith("/broadcast")
-)
-async def broadcast_handler(message: types.Message):
-    """
-    Broadcast a text message to all registered users, optionally with a photo.
-    Only the configured ADMIN_ID can use this command.
-    """
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    command_payload = (message.text or message.caption or "").split(maxsplit=1)
-    if len(command_payload) < 2 or not command_payload[1].strip():
-        await message.answer(
-            "Usage: /broadcast <message to send to all users>.\n"
-            "You can attach an image to send it with the message.",
-        )
-        return
-
-    broadcast_text = command_payload[1].strip()
-    photo_id = message.photo[-1].file_id if message.photo else None
-    user_ids = await get_all_user_ids()
-
-    delivered = 0
-    failed = 0
-
-    for user_id in user_ids:
-        try:
-            if photo_id:
-                await bot.send_photo(user_id, photo_id, caption=broadcast_text)
-            else:
-                await bot.send_message(user_id, broadcast_text)
-            delivered += 1
-        except Exception as e:  # noqa: BLE001
-            print(f"[WARN] Failed to broadcast to {user_id}: {e}")
-            failed += 1
-
-    await message.answer(
-        f"Broadcast complete. Delivered: {delivered}. Failed: {failed}.",
-    )
-
-
 @dp.message(F.text == "/wipe_me")
 async def wipe_me_handler(message: types.Message):
     """
@@ -1503,6 +1426,15 @@ async def generic_handler(message: types.Message):
             "Use the buttons to open Friends or Help, or paste a link to share it with friends.",
             reply_markup=main_keyboard(user_paused),
         )
+
+
+register_admin_handlers(
+    dp=dp,
+    bot=bot,
+    settings=settings,
+    database=database,
+    generic_handler=generic_handler,
+)
 
 
 async def on_startup(app):
