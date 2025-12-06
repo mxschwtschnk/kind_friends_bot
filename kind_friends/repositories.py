@@ -78,6 +78,16 @@ class Database:
                 );
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wishlists (
+                    id SERIAL PRIMARY KEY,
+                    owner_telegram_id BIGINT NOT NULL,
+                    url TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
 
     async def get_or_create_user(self, tg_id: int, username: str | None) -> bool:
         if not self.pool:
@@ -505,6 +515,10 @@ class Database:
                 tg_id,
             )
             await conn.execute(
+                "DELETE FROM wishlists WHERE owner_telegram_id = $1;",
+                tg_id,
+            )
+            await conn.execute(
                 "DELETE FROM users WHERE telegram_id = $1;",
                 tg_id,
             )
@@ -555,4 +569,59 @@ class Database:
             await conn.execute(
                 "DELETE FROM users WHERE telegram_id = ANY($1::bigint[]);",
                 ids,
+            )
+
+    async def add_wishlist_item(self, owner_id: int, url: str) -> int:
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO wishlists (owner_telegram_id, url)
+                VALUES ($1, $2)
+                RETURNING id;
+                """,
+                owner_id,
+                url,
+            )
+        return int(row["id"])
+
+    async def get_wishlist_items(self, owner_id: int):
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT id, owner_telegram_id, url, created_at
+                FROM wishlists
+                WHERE owner_telegram_id = $1
+                ORDER BY created_at ASC;
+                """,
+                owner_id,
+            )
+
+    async def get_wishlist_item(self, item_id: int):
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT id, owner_telegram_id, url, created_at
+                FROM wishlists
+                WHERE id = $1;
+                """,
+                item_id,
+            )
+
+    async def delete_wishlist_item(self, owner_id: int, item_id: int):
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM wishlists
+                WHERE id = $1 AND owner_telegram_id = $2;
+                """,
+                item_id,
+                owner_id,
             )
