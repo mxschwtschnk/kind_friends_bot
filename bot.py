@@ -1157,7 +1157,7 @@ async def generic_handler(message: types.Message):
                 invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
                 await message.answer(
                     "I can't find this user in **Kind Friends** yet.\n\n"
-                    "I'll send you an invite message next that you can forward to them.",
+                    "Forward my previous message with invitation link to your friends.",
                 )
                 await message.answer(
                     "👋 I use Kind Friends to share my links with friends so they can support me "
