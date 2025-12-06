@@ -12,10 +12,23 @@ class Settings:
     max_friends: int = 15
     admin_max_friends: int = 50
     max_daily_links: int = 5
+    alpha_users: list[int] | None = None
+    alpha_users_max_friends: int = 50
 
 
 class SettingsLoaderError(RuntimeError):
     pass
+
+
+def _get_required_int_env(var_name: str) -> int:
+    value = os.getenv(var_name)
+    if value is None or value.strip() == "":
+        raise SettingsLoaderError(f"{var_name} is not set")
+
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise SettingsLoaderError(f"{var_name} must be an integer") from exc
 
 
 def load_settings() -> Settings:
@@ -23,6 +36,11 @@ def load_settings() -> Settings:
     database_url = os.getenv("DATABASE_URL")
     bot_username = os.getenv("BOT_USERNAME", "KindFriendsBot")
     admin_id = int(os.getenv("ADMIN_ID", "0"))
+    max_friends = _get_required_int_env("MAX_FRIENDS")
+    admin_max_friends = _get_required_int_env("ADMIN_MAX_FRIENDS")
+    max_daily_links = _get_required_int_env("MAX_DAILY_LINKS")
+    alpha_users_raw = os.getenv("ALPHA_USERS", "")
+    alpha_users_max_friends = _get_required_int_env("ALPHA_USERS_MAX_FRIENDS")
 
     feedback_raw = os.getenv("FEEDBACK_RECIPIENT_CHAT_ID")
     feedback_recipient = int(feedback_raw) if feedback_raw else admin_id
@@ -38,4 +56,9 @@ def load_settings() -> Settings:
         bot_username=bot_username,
         admin_id=admin_id,
         feedback_recipient_chat_id=feedback_recipient,
+        max_friends=max_friends,
+        admin_max_friends=admin_max_friends,
+        max_daily_links=max_daily_links,
+        alpha_users=[int(tg_id.strip()) for tg_id in alpha_users_raw.split(",") if tg_id.strip()],
+        alpha_users_max_friends=alpha_users_max_friends,
     )

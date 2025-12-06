@@ -60,6 +60,7 @@ def service():
         max_friends=2,
         admin_max_friends=3,
         max_daily_links=5,
+        alpha_users=[],
     )
     repo = DummyRepo()
     return FriendService(repo, settings)
@@ -81,9 +82,12 @@ def test_get_max_friends_for_admin():
         bot_username="bot",
         admin_id=42,
         feedback_recipient_chat_id=42,
+        alpha_users=[7],
+        alpha_users_max_friends=25,
     )
     assert get_max_friends(settings, 42) == settings.admin_max_friends
     assert get_max_friends(settings, 1) == settings.max_friends
+    assert get_max_friends(settings, 7) == settings.alpha_users_max_friends
 
 
 def test_can_invite_more_allows_under_limit(service: FriendService):
@@ -101,6 +105,7 @@ def test_can_invite_more_blocks_when_full():
         max_friends=1,
         admin_max_friends=2,
         max_daily_links=5,
+        alpha_users=[],
     )
     repo = DummyRepo(friend_count=1)
     service = FriendService(repo, settings)
