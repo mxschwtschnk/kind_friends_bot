@@ -26,6 +26,7 @@ from kind_friends.services.friend_service import (
     get_max_friends,
     normalize_username_input,
 )
+from kind_friends.session_store import SessionStore
 from admin_commands import register_admin_handlers
 
 settings = load_settings()
@@ -35,11 +36,17 @@ MAX_DAILY_LINKS = settings.max_daily_links
 ADMIN_ID = settings.admin_id
 FEEDBACK_RECIPIENT_CHAT_ID = settings.feedback_recipient_chat_id
 
+FLOW_ADD_FRIEND = "add_friend"
+FLOW_REMOVE_FRIEND = "remove_friend"
+FLOW_FEEDBACK = "feedback"
+FLOW_DELETE_ACCOUNT = "delete_account_confirmation"
+
 bot = Bot(token=settings.bot_token)
 dp = Dispatcher()
 
 database = Database(settings.database_url)
 friend_service = FriendService(database, settings)
+session_store = SessionStore(database)
 
 pool = database.pool
 
@@ -78,10 +85,6 @@ increment_invite_count = database.increment_invite_count
 get_invite_count = database.get_invite_count
 clear_sent_links = database.clear_sent_links
 bulk_delete_users = database.bulk_delete_users
-add_friend_mode = set()  # user_ids who are adding a friend
-remove_friend_mode = set()  # user_ids who are removing a friend
-feedback_mode = set()  # user_ids who are sending feedback
-delete_account_confirmation = set()  # user_ids awaiting delete confirmation
 
 
 class LoadingIndicator:
@@ -707,7 +710,7 @@ async def how_to_handler(message: types.Message):
 @dp.message(F.text == "🧹 Wipe Account")
 async def delete_account_prompt(message: types.Message):
     user_id = message.from_user.id
-    delete_account_confirmation.add(user_id)
+    await session_store.set_flow(user_id, FLOW_DELETE_ACCOUNT)
     await message.answer(
         "Are you sure you want to wipe your Kind Friends account?\n\n"
         "This will remove all friends, delete any stored pending links, and new links will no longer arrive.\n"
@@ -723,7 +726,7 @@ async def delete_account_prompt(message: types.Message):
 
 @dp.message(F.text == "💬 Feedback")
 async def start_feedback_from_menu(message: types.Message):
-    feedback_mode.add(message.from_user.id)
+    await session_store.set_flow(message.from_user.id, FLOW_FEEDBACK)
     await message.answer(
         "Thanks for willing to share feedback!\nSend your thoughts in one message and I'll pass it along.",
         reply_markup=feedback_keyboard(),
@@ -733,10 +736,7 @@ async def start_feedback_from_menu(message: types.Message):
 @dp.message(F.text == "⬅️ Back")
 async def back_to_main(message: types.Message):
     user_paused = await is_paused(message.from_user.id)
-    add_friend_mode.discard(message.from_user.id)
-    remove_friend_mode.discard(message.from_user.id)
-    feedback_mode.discard(message.from_user.id)
-    delete_account_confirmation.discard(message.from_user.id)
+    await session_store.clear_flow(message.from_user.id)
     await message.answer(
         "Back to the main menu.",
         reply_markup=main_keyboard(user_paused),
@@ -809,8 +809,7 @@ async def resume_handler(message: types.Message):
 @dp.message(F.text == "➕ Invite")
 async def invite_friends_handler(message: types.Message):
     user_id = message.from_user.id
-    add_friend_mode.add(user_id)
-    remove_friend_mode.discard(user_id)
+    await session_store.set_flow(user_id, FLOW_ADD_FRIEND)
     invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
     await message.answer(
         "Send me your friend's Telegram @username.\n"
@@ -857,8 +856,7 @@ async def friends_handler(message: types.Message):
         )
 
     text += "\n\nChoose an option below."
-    add_friend_mode.discard(user_id)
-    remove_friend_mode.discard(user_id)
+    await session_store.clear_flow(user_id)
     await message.answer(text, parse_mode="Markdown", reply_markup=friends_keyboard())
 
 
@@ -874,8 +872,7 @@ async def remove_friend_handler(message: types.Message):
         )
         return
 
-    remove_friend_mode.add(user_id)
-    add_friend_mode.discard(user_id)
+    await session_store.set_flow(user_id, FLOW_REMOVE_FRIEND)
     await message.answer(
         "You can now delete your friends from the list.\n"
         "Choose one or a few by clicking on the tags below.",
@@ -891,7 +888,7 @@ async def remove_friend_handler(message: types.Message):
 async def remove_friend_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
-    if user_id not in remove_friend_mode:
+    if not await session_store.is_in_flow(user_id, FLOW_REMOVE_FRIEND):
         await callback.answer("Remove mode is closed. Tap ➖ Remove to start again.", show_alert=True)
         return
 
@@ -924,7 +921,7 @@ async def remove_friend_callback(callback: types.CallbackQuery):
         except Exception as e:  # noqa: BLE001
             print(f"[WARN] Failed to refresh removal keyboard for {user_id}: {e}")
     else:
-        remove_friend_mode.discard(user_id)
+        await session_store.clear_flow(user_id)
         try:
             await callback.message.edit_text(
                 "You don't have any friends connected yet.\nTap “➕ Invite” to add someone.",
@@ -1051,7 +1048,7 @@ async def decline_friend_request(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "start_feedback")
 async def start_feedback(callback: types.CallbackQuery):
-    feedback_mode.add(callback.from_user.id)
+    await session_store.set_flow(callback.from_user.id, FLOW_FEEDBACK)
     await callback.message.answer(
         "Thanks for willing to share feedback!\n"
         "Send your thoughts in one message and I'll pass it along.",
@@ -1087,8 +1084,11 @@ async def generic_handler(message: types.Message):
     user_paused = await is_paused(user_id)
 
     async with LoadingIndicator(message):
+        session_state = await session_store.get_state(user_id)
+        flow = session_state.flow
+
         # 0) Feedback mode
-        if user_id in feedback_mode:
+        if flow == FLOW_FEEDBACK:
             if message.content_type != types.ContentType.TEXT:
                 await message.answer(
                     "I couldn't deliver your feedback because it included media. "
@@ -1097,8 +1097,7 @@ async def generic_handler(message: types.Message):
                 )
                 return
 
-            feedback_mode.discard(user_id)
-            delete_account_confirmation.discard(user_id)
+            await session_store.clear_flow(user_id)
             delivered = await deliver_feedback_to_admin(message.from_user, text)
             if not delivered:
                 await message.answer(
@@ -1114,8 +1113,8 @@ async def generic_handler(message: types.Message):
             return
 
         # 0.1) Delete confirmation
-        if user_id in delete_account_confirmation:
-            delete_account_confirmation.discard(user_id)
+        if flow == FLOW_DELETE_ACCOUNT:
+            await session_store.clear_flow(user_id)
             if text == "Yes, wipe":
                 await delete_user_completely(user_id)
                 await message.answer(
@@ -1134,8 +1133,8 @@ async def generic_handler(message: types.Message):
                 return
 
         # 1) Add friend mode
-        if user_id in add_friend_mode and text.startswith("@"):
-            add_friend_mode.discard(user_id)
+        if flow == FLOW_ADD_FRIEND and text.startswith("@"):
+            await session_store.clear_flow(user_id)
             friend_username_raw = text.strip()
 
             friend_count = await get_friend_count(user_id)
@@ -1303,8 +1302,8 @@ async def generic_handler(message: types.Message):
             return
 
         # 1.5) Remove friend mode
-        if user_id in remove_friend_mode:
-            remove_friend_mode.discard(user_id)
+        if flow == FLOW_REMOVE_FRIEND:
+            await session_store.clear_flow(user_id)
             friend_username_raw = normalize_username_input(text)
             if not friend_username_raw:
                 await message.answer(
