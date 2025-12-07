@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from datetime import datetime, timedelta, timezone
 import math
 from urllib.parse import urljoin
@@ -623,6 +624,52 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
 
     html_slice = raw_html[:200000]
 
+    def _clean_title(title: str | None) -> str | None:
+        if not title:
+            return None
+        for sep in (" | ", " – ", " — ", " - "):
+            if sep in title:
+                return title.split(sep)[0].strip() or title.strip()
+        return title.strip()
+
+    def _extract_product_from_ld_json():
+        scripts = re.findall(
+            r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+            html_slice,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        def _walk(data):
+            if isinstance(data, list):
+                for item in data:
+                    found = _walk(item)
+                    if found:
+                        return found
+            elif isinstance(data, dict):
+                type_field = data.get("@type")
+                types = [type_field] if isinstance(type_field, str) else type_field or []
+                if any(isinstance(t, str) and t.lower() == "product" for t in types):
+                    name = data.get("name")
+                    image = data.get("image")
+                    if isinstance(image, list) and image:
+                        image = image[0]
+                    return {"title": name, "image": image}
+                for value in data.values():
+                    found = _walk(value)
+                    if found:
+                        return found
+            return None
+
+        for script in scripts:
+            try:
+                parsed = json.loads(script.strip())
+            except Exception:
+                continue
+            found = _walk(parsed)
+            if found:
+                return found
+        return None
+
     def _extract_attr(tag: str, attr: str) -> str | None:
         match = re.search(rf'{attr}\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
         return match.group(1).strip() if match else None
@@ -645,8 +692,14 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
         match = re.search(r"<title[^>]*>(.*?)</title>", html_slice, re.IGNORECASE | re.DOTALL)
         return match.group(1).strip() if match else None
 
-    title = _search_meta(("og:title", "twitter:title", "twitter:text:title", "title")) or _search_title_tag()
-    image = _search_meta(("og:image", "twitter:image", "twitter:image:src"))
+    structured = _extract_product_from_ld_json() or {}
+
+    title = structured.get("title") or _search_meta(("og:title", "twitter:title", "twitter:text:title", "title"))
+    if not title:
+        title = _search_title_tag()
+    title = _clean_title(title)
+
+    image = structured.get("image") or _search_meta(("og:image", "twitter:image", "twitter:image:src"))
     if image:
         image = urljoin(url, image)
 
