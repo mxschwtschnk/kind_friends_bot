@@ -642,7 +642,10 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
         # Filter out chunks that look like domain names or store names so that we keep
         # the actual product title when possible (e.g., drop "Amazon.de" and keep the
         # product description).
-        store_pattern = re.compile(r"\b(amazon|etsy|ebay|walmart|aliexpress|target)\b", re.IGNORECASE)
+        store_pattern = re.compile(
+            r"\b(amazon|etsy|ebay|walmart|aliexpress|target|zalando|shein|bestbuy)\b",
+            re.IGNORECASE,
+        )
         domain_pattern = re.compile(r"\b\w+\.\w+\b")
         descriptive_parts = [
             p for p in parts if not store_pattern.search(p) and not domain_pattern.search(p)
@@ -673,13 +676,25 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
                 type_field = data.get("@type")
                 types = [type_field] if isinstance(type_field, str) else type_field or []
                 if any(isinstance(t, str) and t.lower() == "product" for t in types):
-                    name = data.get("name")
-                    image = data.get("image")
+                    name = data.get("name") or data.get("headline")
+                    image = data.get("image") or data.get("thumbnailUrl")
                     if isinstance(image, list) and image:
                         image = image[0]
                     if isinstance(image, dict):
                         image = image.get("url") or image.get("@id")
                     return {"title": name, "image": image}
+
+                if any(isinstance(t, str) and t.lower() == "offer" for t in types):
+                    item_offered = data.get("itemOffered")
+                    if isinstance(item_offered, dict):
+                        name = item_offered.get("name") or item_offered.get("headline")
+                        image = item_offered.get("image") or item_offered.get("thumbnailUrl")
+                        if isinstance(image, list) and image:
+                            image = image[0]
+                        if isinstance(image, dict):
+                            image = image.get("url") or image.get("@id")
+                        if name or image:
+                            return {"title": name, "image": image}
                 for value in data.values():
                     found = _walk(value)
                     if found:
@@ -703,7 +718,11 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
     meta_tags = re.findall(r"<meta[^>]*>", html_slice, flags=re.IGNORECASE)
     meta_map: dict[str, str] = {}
     for tag in meta_tags:
-        name = _extract_attr(tag, "property") or _extract_attr(tag, "name")
+        name = (
+            _extract_attr(tag, "property")
+            or _extract_attr(tag, "name")
+            or _extract_attr(tag, "itemprop")
+        )
         content = _extract_attr(tag, "content")
         if name and content and name.lower() not in meta_map:
             meta_map[name.lower()] = content.strip()
@@ -718,20 +737,48 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
         match = re.search(r"<title[^>]*>(.*?)</title>", html_slice, re.IGNORECASE | re.DOTALL)
         return match.group(1).strip() if match else None
 
+    def _search_heading():
+        match = re.search(r"<h1[^>]*>(.*?)</h1>", html_slice, re.IGNORECASE | re.DOTALL)
+        return match.group(1).strip() if match else None
+
     structured = _extract_product_from_ld_json() or {}
 
-    title = structured.get("title") or _search_meta(("og:title", "twitter:title", "twitter:text:title", "title"))
-    if not title:
-        title = _search_title_tag()
-    title = _clean_title(title)
+    title_candidates = [structured.get("title")]
+    title_candidates.append(
+        _search_meta(
+            (
+                "og:title",
+                "twitter:title",
+                "twitter:text:title",
+                "product:title",
+                "title",
+                "name",
+                "itemprop:title",
+                "itemprop:name",
+            )
+        )
+    )
+    title_candidates.append(_search_title_tag())
+    title_candidates.append(_search_heading())
+
+    title = None
+    for candidate in title_candidates:
+        cleaned = _clean_title(candidate)
+        if cleaned:
+            title = cleaned
+            break
 
     image = structured.get("image") or _search_meta(
         (
             "og:image",
+            "og:image:url",
             "og:image:secure_url",
             "twitter:image",
             "twitter:image:src",
             "twitter:image:alt",
+            "itemprop:image",
+            "image",
+            "thumbnailurl",
         )
     )
     if image:
