@@ -677,6 +677,18 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
             flags=re.IGNORECASE | re.DOTALL,
         )
 
+        def _normalize_image(img_val):
+            if isinstance(img_val, list):
+                if not img_val:
+                    return None
+                first = img_val[0]
+                if isinstance(first, dict):
+                    return first.get("url") or first.get("@id")
+                return first
+            if isinstance(img_val, dict):
+                return img_val.get("url") or img_val.get("@id")
+            return img_val
+
         def _walk(data):
             best: dict[str, str | None] | None = None
 
@@ -735,6 +747,34 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
         content = _extract_attr(tag, "content")
         if name and content and name.lower() not in meta_map:
             meta_map[name.lower()] = content.strip()
+
+    def _search_img_tags():
+        images = []
+        for tag in re.findall(r"<img[^>]+>", html_slice, flags=re.IGNORECASE):
+            src = (
+                _extract_attr(tag, "src")
+                or _extract_attr(tag, "data-src")
+                or _extract_attr(tag, "data-original")
+            )
+            if not src:
+                continue
+            width = _extract_attr(tag, "width")
+            height = _extract_attr(tag, "height")
+            score = 0
+            try:
+                if width:
+                    score += int(width)
+                if height:
+                    score += int(height)
+            except ValueError:
+                pass
+            if re.search(r"1200|1600|2048|_UX|_SL", src):
+                score += 500
+            images.append((score, src))
+        if not images:
+            return None
+        images.sort(key=lambda x: x[0], reverse=True)
+        return images[0][1]
 
     def _search_meta(names: tuple[str, ...]):
         for name in names:
