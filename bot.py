@@ -87,6 +87,9 @@ add_wishlist_item = database.add_wishlist_item
 get_wishlist_items = database.get_wishlist_items
 get_wishlist_item = database.get_wishlist_item
 delete_wishlist_item = database.delete_wishlist_item
+reserve_wishlist_item = database.reserve_wishlist_item
+unreserve_wishlist_item = database.unreserve_wishlist_item
+mark_wishlist_item_gotten = database.mark_wishlist_item_gotten
 add_friend_mode = set()  # user_ids who are adding a friend
 remove_friend_mode = set()  # user_ids who are removing a friend
 remove_friend_confirmations: dict[int, str] = {}  # user -> username awaiting confirm
@@ -1053,21 +1056,6 @@ def wishlist_items_keyboard(items, editable: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def wishlist_item_action_keyboard(item) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Open", url=item["url"])],
-            [InlineKeyboardButton(text="Delete", callback_data=f"wishlist_delete:{item['id']}")],
-        ]
-    )
-
-
-def wishlist_item_delete_button(item_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Delete", callback_data=f"wishlist_delete:{item_id}")]]
-    )
-
-
 async def _remove_wishlist_item_button(message: types.Message, item_id: int) -> None:
     """Remove a wishlist item's button from the inline keyboard, if present."""
 
@@ -1094,6 +1082,70 @@ async def _remove_wishlist_item_button(message: types.Message, item_id: int) -> 
         print(f"[WARN] Failed to remove wishlist item button {item_id}: {e}")
 
 
+def _wishlist_item_text(item, viewer_id: int) -> str:
+    prefix = None
+    reserver = item.get("reserved_by_telegram_id")
+    if reserver:
+        prefix = "(Reserved by me)" if reserver == viewer_id else "(Reserved by friend)"
+
+    base = item.get("url") or ""
+    if prefix:
+        return f"{prefix} {base}"
+    return base
+
+
+def wishlist_item_keyboard(item, viewer_id: int, is_owner: bool) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = [[InlineKeyboardButton(text="Open", url=item["url"])]]
+    reserved_by = item.get("reserved_by_telegram_id")
+
+    if is_owner:
+        if reserved_by is None:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Delete", callback_data=f"wishlist_delete:{item['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        text="Reserve", callback_data=f"wishlist_reserve:{item['id']}"
+                    ),
+                ]
+            )
+        elif reserved_by == viewer_id:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Got it!", callback_data=f"wishlist_got:{item['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        text="Unreserve", callback_data=f"wishlist_unreserve:{item['id']}"
+                    ),
+                ]
+            )
+        else:
+            buttons.append(
+                [InlineKeyboardButton(text="Got it!", callback_data=f"wishlist_got:{item['id']}")]
+            )
+    else:
+        if reserved_by == viewer_id:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Unreserve", callback_data=f"wishlist_unreserve:{item['id']}"
+                    )
+                ]
+            )
+        else:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Reserve", callback_data=f"wishlist_reserve:{item['id']}"
+                    )
+                ]
+            )
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 async def _confirm_or_delete_wishlist_item(
     callback: types.CallbackQuery, item_id: int
 ) -> None:
@@ -1103,6 +1155,13 @@ async def _confirm_or_delete_wishlist_item(
     if not item or item["owner_telegram_id"] != callback.from_user.id:
         wishlist_delete_confirmations.pop(callback.from_user.id, None)
         await callback.answer("This wishlist item is no longer available.", show_alert=True)
+        return
+
+    if item.get("reserved_by_telegram_id"):
+        await callback.answer(
+            "This wishlist item is reserved and cannot be deleted right now.",
+            show_alert=True,
+        )
         return
 
     wishlist_delete_confirmations.pop(callback.from_user.id, None)
@@ -1139,6 +1198,13 @@ async def _delete_wishlist_item_from_confirmation(message: types.Message) -> Non
         )
         return
 
+    if item.get("reserved_by_telegram_id"):
+        await message.answer(
+            "You can't delete this wish because it is reserved.",
+            reply_markup=wishlist_keyboard(),
+        )
+        return
+
     await delete_wishlist_item(user_id, item_id)
 
     if not target_message_id:
@@ -1160,6 +1226,21 @@ async def _delete_wishlist_item_from_confirmation(message: types.Message) -> Non
 
     if get_submenu(user_id) == "wishlist_delete":
         await send_wishlist_items(message, user_id, delete_mode=True)
+
+
+async def _get_visible_wishlist_item(item_id: int, viewer_id: int):
+    item = await get_wishlist_item(item_id)
+    if not item:
+        return None
+
+    if item.get("got_at"):
+        return None
+
+    reserved_by = item.get("reserved_by_telegram_id")
+    if reserved_by and reserved_by != viewer_id and item.get("owner_telegram_id") != viewer_id:
+        return None
+
+    return item
 # -------------------------------------------------------------------
 # FEEDBACK
 # -------------------------------------------------------------------
@@ -1301,14 +1382,22 @@ async def send_editable_wishlist(
 
 
 async def send_wishlist_items(
-    message: types.Message, user_id: int, delete_mode: bool = False
+    message: types.Message,
+    user_id: int,
+    delete_mode: bool = False,
+    viewer_id: int | None = None,
 ) -> None:
-    items = [dict(item) for item in await get_wishlist_items(user_id)]
+    viewer_id = viewer_id or user_id
+    is_owner = user_id == viewer_id
+    items = [dict(item) for item in await get_wishlist_items(user_id, viewer_id)]
     if not items:
-        await message.answer(
-            "Your wishlist is empty right now. Send me a link to add your first item.",
-            reply_markup=wishlist_keyboard(),
-        )
+        if is_owner:
+            await message.answer(
+                "Your wishlist is empty right now. Send me a link to add your first item.",
+                reply_markup=wishlist_keyboard(),
+            )
+        else:
+            await message.answer("This wishlist is empty right now.")
         return
 
     if delete_mode:
@@ -1319,8 +1408,8 @@ async def send_wishlist_items(
 
     for item in items:
         await message.answer(
-            item["url"],
-            reply_markup=wishlist_item_delete_button(item["id"]),
+            _wishlist_item_text(item, viewer_id),
+            reply_markup=wishlist_item_keyboard(item, viewer_id, is_owner=is_owner),
         )
 
 
@@ -1334,9 +1423,10 @@ async def add_links_to_wishlist(
 
     for idx, (item_id, url) in enumerate(saved):
         prefix = "Saved to your wishlist ✅\n" if idx == 0 else ""
+        item = await get_wishlist_item(item_id)
         await message.answer(
-            f"{prefix}{url}",
-            reply_markup=wishlist_item_delete_button(item_id),
+            f"{prefix}{_wishlist_item_text(item, user_id)}",
+            reply_markup=wishlist_item_keyboard(item, user_id, is_owner=True),
         )
 
 
@@ -1828,6 +1918,90 @@ async def wishlist_delete_callback(callback: types.CallbackQuery):
     await _confirm_or_delete_wishlist_item(callback, item_id)
 
 
+async def _refresh_wishlist_message(
+    callback: types.CallbackQuery, item, is_owner: bool, viewer_id: int
+):
+    await callback.message.edit_text(
+        _wishlist_item_text(item, viewer_id),
+        reply_markup=wishlist_item_keyboard(item, viewer_id, is_owner=is_owner),
+        disable_web_page_preview=False,
+    )
+
+
+@dp.callback_query(F.data.startswith("wishlist_reserve:"))
+async def wishlist_reserve_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    item = await _get_visible_wishlist_item(item_id, user_id)
+    if not item:
+        await callback.answer("This wish is no longer available.", show_alert=True)
+        return
+
+    success = await reserve_wishlist_item(item_id, user_id)
+    if not success:
+        await callback.answer("Someone else already reserved this wish.", show_alert=True)
+        return
+
+    item = await get_wishlist_item(item_id)
+    await _refresh_wishlist_message(callback, item, item["owner_telegram_id"] == user_id, user_id)
+    await callback.answer("Reserved!")
+
+
+@dp.callback_query(F.data.startswith("wishlist_unreserve:"))
+async def wishlist_unreserve_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    item = await _get_visible_wishlist_item(item_id, user_id)
+    if not item:
+        await callback.answer("This wish is no longer available.", show_alert=True)
+        return
+
+    success = await unreserve_wishlist_item(item_id, user_id)
+    if not success:
+        await callback.answer("You can't unreserve this wish.", show_alert=True)
+        return
+
+    item = await get_wishlist_item(item_id)
+    await _refresh_wishlist_message(callback, item, item["owner_telegram_id"] == user_id, user_id)
+    await callback.answer("Unreserved.")
+
+
+@dp.callback_query(F.data.startswith("wishlist_got:"))
+async def wishlist_got_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    item = await get_wishlist_item(item_id)
+    if not item or item.get("owner_telegram_id") != user_id:
+        await callback.answer("This wish is not available.", show_alert=True)
+        return
+
+    success = await mark_wishlist_item_gotten(user_id, item_id)
+    if not success:
+        await callback.answer("This wish was already handled.", show_alert=True)
+        return
+
+    try:
+        await callback.message.delete()
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to delete wish message {item_id}: {e}")
+    await callback.answer("Marked as received!", show_alert=False)
+
+
 @dp.callback_query(F.data.startswith("wishlist_delete_confirm:"))
 async def wishlist_delete_confirm_callback(callback: types.CallbackQuery):
     try:
@@ -1954,16 +2128,18 @@ async def friend_wishlist_callback(callback: types.CallbackQuery):
         await callback.answer("You are no longer connected with this friend.", show_alert=True)
         return
 
-    items = [dict(item) for item in await get_wishlist_items(friend_tg_id)]
-    if not items:
+    visible_items = [dict(item) for item in await get_wishlist_items(friend_tg_id, callback.from_user.id)]
+    if not visible_items:
         await callback.answer("This wishlist is empty right now.", show_alert=True)
         return
 
     await callback.answer()
-    await callback.message.answer(
-        f"Wishlist for @{friend_username_raw}:",
-        reply_markup=wishlist_items_keyboard(items, editable=False),
-    )
+    await callback.message.answer(f"Wishlist for @{friend_username_raw}:")
+    for item in visible_items:
+        await callback.message.answer(
+            _wishlist_item_text(item, callback.from_user.id),
+            reply_markup=wishlist_item_keyboard(item, callback.from_user.id, is_owner=False),
+        )
 
 
 @dp.callback_query(F.data.startswith("friend_accept:"))
