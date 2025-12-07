@@ -3,6 +3,7 @@ import re
 import json
 from datetime import datetime, timedelta, timezone
 import math
+from typing import Literal
 
 import asyncio
 import aiohttp
@@ -91,6 +92,23 @@ feedback_mode = set()  # user_ids who are sending feedback
 delete_account_confirmation = set()  # user_ids awaiting delete confirmation
 wishlist_add_mode = set()  # user_ids adding wishlist entries
 pending_link_actions: dict[int, str] = {}  # last link sent by user waiting for action
+Submenu = Literal[
+    "root",
+    "friends",
+    "friends_invite",
+    "friends_remove",
+    "help",
+    "wishlist",
+]
+current_submenu: dict[int, Submenu] = {}
+
+
+def set_submenu(user_id: int, submenu: Submenu) -> None:
+    current_submenu[user_id] = submenu
+
+
+def get_submenu(user_id: int) -> Submenu:
+    return current_submenu.get(user_id, "root")
 
 
 class LoadingIndicator:
@@ -916,6 +934,7 @@ async def cmd_start(message: types.Message):
         message.from_user.id,
         message.from_user.username,
     )
+    set_submenu(message.from_user.id, "root")
 
     # Handle deep-link invitation (/start <inviter_id>)
     inviter_id: int | None = None
@@ -979,6 +998,7 @@ async def start_text_handler(message: types.Message):
 
 @dp.message(F.text == "ℹ️ Help")
 async def help_handler(message: types.Message):
+    set_submenu(message.from_user.id, "help")
     await message.answer(
         "Pick a help option:",
         reply_markup=help_keyboard(),
@@ -986,6 +1006,7 @@ async def help_handler(message: types.Message):
 
 
 async def send_editable_wishlist(message: types.Message, user_id: int):
+    set_submenu(user_id, "wishlist")
     wishlist_add_mode.add(user_id)
     items = [dict(item) for item in await get_wishlist_items(user_id)]
     if not items:
@@ -1017,13 +1038,7 @@ async def wishlist_menu(message: types.Message):
 @dp.message(F.text == "➕ Add link")
 async def wishlist_add_prompt(message: types.Message):
     user_id = message.from_user.id
-    if await is_paused(user_id):
-        await message.answer(
-            "You are currently on pause. Tap ▶️ Resume to add wishlist items.",
-            reply_markup=pause_overlay_keyboard(),
-        )
-        return
-
+    set_submenu(user_id, "wishlist")
     wishlist_add_mode.add(user_id)
     await message.answer(
         "Send me a link to add to your wishlist.",
@@ -1103,12 +1118,29 @@ async def start_feedback_from_menu(message: types.Message):
 
 @dp.message(F.text == "⬅️ Back")
 async def back_to_main(message: types.Message):
-    user_paused = await is_paused(message.from_user.id)
-    add_friend_mode.discard(message.from_user.id)
-    remove_friend_mode.discard(message.from_user.id)
-    feedback_mode.discard(message.from_user.id)
-    delete_account_confirmation.discard(message.from_user.id)
-    wishlist_add_mode.discard(message.from_user.id)
+    user_id = message.from_user.id
+    submenu = get_submenu(user_id)
+
+    if submenu in {"friends", "friends_invite", "friends_remove"}:
+        set_submenu(user_id, "friends")
+        await message.answer(
+            "Back to the Friends menu.",
+            reply_markup=friends_keyboard(),
+        )
+        return
+
+    if submenu == "wishlist":
+        await message.answer("Back to your wishlist.", reply_markup=wishlist_keyboard())
+        await send_editable_wishlist(message, user_id)
+        return
+
+    user_paused = await is_paused(user_id)
+    add_friend_mode.discard(user_id)
+    remove_friend_mode.discard(user_id)
+    feedback_mode.discard(user_id)
+    delete_account_confirmation.discard(user_id)
+    wishlist_add_mode.discard(user_id)
+    set_submenu(user_id, "root")
     await message.answer(
         "Back to the main menu.",
         reply_markup=pause_overlay_keyboard() if user_paused else main_keyboard(False),
@@ -1122,6 +1154,7 @@ async def pause_handler(message: types.Message):
     """
     user_id = message.from_user.id
     await set_pause(user_id, True)
+    set_submenu(user_id, "root")
     await message.answer(
         "You are now on pause.\n\n"
         "While you’re on pause:\n"
@@ -1139,6 +1172,7 @@ async def resume_handler(message: types.Message):
     """
     user_id = message.from_user.id
     await set_pause(user_id, False)
+    set_submenu(user_id, "root")
 
     rows = await get_pending_links_for_user(user_id)
 
@@ -1181,6 +1215,7 @@ async def resume_handler(message: types.Message):
 @dp.message(F.text == "➕ Invite")
 async def invite_friends_handler(message: types.Message):
     user_id = message.from_user.id
+    set_submenu(user_id, "friends_invite")
     add_friend_mode.add(user_id)
     remove_friend_mode.discard(user_id)
     invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
@@ -1202,12 +1237,14 @@ async def invite_friends_handler(message: types.Message):
 async def friends_handler(message: types.Message):
     user_id = message.from_user.id
     if await is_paused(user_id):
+        set_submenu(user_id, "root")
         await message.answer(
             "You are currently on pause. Tap ▶️ Resume to manage friends again.",
             reply_markup=pause_overlay_keyboard(),
         )
         return
 
+    set_submenu(user_id, "friends")
     friend_count = await get_friend_count(user_id)
     friends = await get_friend_usernames(user_id)
     pending_requests = await get_pending_requests_with_usernames_for_requester(user_id)
@@ -1256,6 +1293,7 @@ async def remove_friend_handler(message: types.Message):
 
     remove_friend_mode.add(user_id)
     add_friend_mode.discard(user_id)
+    set_submenu(user_id, "friends_remove")
     await message.answer(
         "You can now delete your friends from the list.\n"
         "Choose one or a few by clicking on the tags below.",
@@ -1312,6 +1350,7 @@ async def remove_friend_callback(callback: types.CallbackQuery):
             )
         except Exception as e:  # noqa: BLE001
             print(f"[WARN] Failed to update empty removal message for {user_id}: {e}")
+        set_submenu(user_id, "friends")
         await callback.message.answer(
             "Friend list is empty now. Returning to Friends menu.",
             reply_markup=friends_keyboard(),
@@ -1399,6 +1438,7 @@ async def friend_remove_from_card(callback: types.CallbackQuery):
     await notify_friend_removed(user_id, friend_tg_id)
 
     await callback.answer("Friend removed.")
+    set_submenu(user_id, "friends")
     await callback.message.answer(
         f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
         reply_markup=friends_keyboard(),
@@ -1658,6 +1698,7 @@ async def link_action_wishlist(callback: types.CallbackQuery):
 
     async with aiohttp.ClientSession() as session:
         title = await _fetch_title_for_url(session, url)
+    set_submenu(callback.from_user.id, "wishlist")
     await add_wishlist_item(callback.from_user.id, url, title)
     await callback.message.answer(
         "Saved to your wishlist ✅",
@@ -1987,6 +2028,7 @@ async def generic_handler(message: types.Message):
             return
 
         # 4) Fallback
+        set_submenu(user_id, "root")
         await message.answer(
             "Use the buttons to open Friends or Help, or paste a link to share it with friends.",
             reply_markup=pause_overlay_keyboard() if user_paused else main_keyboard(False),
