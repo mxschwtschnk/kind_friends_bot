@@ -64,11 +64,14 @@ def load_settings() -> Settings:
     database_url = os.getenv("DATABASE_URL")
     bot_username = os.getenv("BOT_USERNAME", "KindFriendsBot")
     admin_id = _get_required_int_env("ADMIN_ID")
-    max_friends = _get_required_int_env("MAX_FRIENDS")
-    admin_max_friends = _get_required_int_env("ADMIN_MAX_FRIENDS")
+    # Friend limits are intentionally fixed in code rather than configurable
+    # through environment variables to keep behavior consistent across
+    # deployments.
+    max_friends = 15
+    admin_max_friends = 50
     max_daily_links = _get_required_int_env("MAX_DAILY_LINKS")
     alpha_users_raw = os.getenv("ALPHA_USERS", "")
-    alpha_users_max_friends = _get_required_int_env("ALPHA_USERS_MAX_FRIENDS")
+    alpha_users_max_friends = 50
 
     feedback_raw = os.getenv("FEEDBACK_RECIPIENT_CHAT_ID")
     feedback_recipient = int(feedback_raw) if feedback_raw else admin_id
