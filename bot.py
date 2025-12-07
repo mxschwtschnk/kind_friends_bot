@@ -3,7 +3,6 @@ import re
 import json
 from datetime import datetime, timedelta, timezone
 import math
-from urllib.parse import urljoin
 
 import asyncio
 import aiohttp
@@ -18,7 +17,6 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    InputMediaPhoto,
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
@@ -600,7 +598,7 @@ def _shorten_url(url: str, max_length: int = 32) -> str:
     return trimmed[: max_length - 1] + "…"
 
 
-async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
+async def _fetch_title_for_url(session, url: str) -> str | None:
     try:
         async with session.get(
             url,
@@ -618,14 +616,14 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
             },
         ) as response:
             if response.status >= 400:
-                return {"title": None, "image": None}
+                return None
             content_type = response.headers.get("content-type", "")
             if "text/html" not in content_type:
-                return {"title": None, "image": None}
+                return None
             raw_html = await response.text(errors="ignore")
     except Exception as e:  # noqa: BLE001
         print(f"[WARN] Failed to fetch metadata for {url}: {e}")
-        return {"title": None, "image": None}
+        return None
 
     html_slice = raw_html[:200000]
 
@@ -696,20 +694,10 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
 
             def _maybe_update(candidate: dict[str, str | None]):
                 nonlocal best
-                if not candidate:
+                if not candidate or not candidate.get("title"):
                     return
-                if not candidate.get("title") and not candidate.get("image"):
-                    return
-                if not best:
+                if not best or len(candidate["title"] or "") > len(best.get("title") or ""):
                     best = candidate
-                    return
-                if candidate.get("title") and (
-                    not best.get("title")
-                    or len(candidate["title"]) > len(best["title"] or "")
-                ):
-                    best = candidate
-                elif candidate.get("image") and not best.get("image"):
-                    best = {**best, "image": candidate.get("image")}
 
             if isinstance(data, list):
                 for item in data:
@@ -721,17 +709,13 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
                 types = [type_field] if isinstance(type_field, str) else type_field or []
                 if any(isinstance(t, str) and t.lower() == "product" for t in types):
                     name = data.get("name") or data.get("headline")
-                    image = _normalize_image(data.get("image") or data.get("thumbnailUrl"))
-                    _maybe_update({"title": name, "image": image})
+                    _maybe_update({"title": name})
 
                 if any(isinstance(t, str) and t.lower() == "offer" for t in types):
                     item_offered = data.get("itemOffered")
                     if isinstance(item_offered, dict):
                         name = item_offered.get("name") or item_offered.get("headline")
-                        image = _normalize_image(
-                            item_offered.get("image") or item_offered.get("thumbnailUrl")
-                        )
-                        _maybe_update({"title": name, "image": image})
+                        _maybe_update({"title": name})
                 for value in data.values():
                     found = _walk(value)
                     if found:
@@ -848,48 +832,7 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
             title = cleaned
             break
 
-    image = structured.get("image") or _search_meta(
-        (
-            "og:image",
-            "og:image:url",
-            "og:image:secure_url",
-            "twitter:image",
-            "twitter:image:src",
-            "twitter:image:alt",
-            "itemprop:image",
-            "image",
-            "thumbnailurl",
-        )
-    )
-    if not image:
-        image = _search_img_tags()
-    if image:
-        image = urljoin(url, image)
-
-    return {"title": title, "image": image}
-
-
-async def enrich_wishlist_items(items):
-    if not items:
-        return []
-
-    urls = [item["url"] for item in items]
-    async with aiohttp.ClientSession() as session:
-        tasks = [_fetch_metadata_for_url(session, url) for url in urls]
-        metadata_list = await asyncio.gather(*tasks, return_exceptions=True)
-
-    enriched_items = []
-    for item, meta in zip(items, metadata_list):
-        meta_data = meta if isinstance(meta, dict) else {"title": None, "image": None}
-        enriched_items.append(
-            {
-                **item,
-                "title": meta_data.get("title") or _shorten_url(item["url"]),
-                "image": meta_data.get("image"),
-            }
-        )
-
-    return enriched_items
+    return title
 
 
 def wishlist_items_keyboard(items, editable: bool) -> InlineKeyboardMarkup:
@@ -912,26 +855,6 @@ def wishlist_item_action_keyboard(item) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🗑 Delete", callback_data=f"wishlist_delete:{item['id']}")],
         ]
     )
-
-
-async def send_wishlist_gallery(message: types.Message, items):
-    media = []
-    for item in items:
-        image_url = item.get("image")
-        if not image_url:
-            continue
-        caption = item.get("title") or _shorten_url(item["url"])
-        media.append(InputMediaPhoto(media=image_url, caption=caption[:1024]))
-        if len(media) >= 10:
-            break
-
-    if media:
-        try:
-            await message.answer_media_group(media)
-        except Exception as e:  # noqa: BLE001
-            print(f"[WARN] Failed to send wishlist gallery: {e}")
-
-
 # -------------------------------------------------------------------
 # FEEDBACK
 # -------------------------------------------------------------------
@@ -1045,7 +968,7 @@ async def help_handler(message: types.Message):
 
 async def send_editable_wishlist(message: types.Message, user_id: int):
     wishlist_add_mode.add(user_id)
-    items = await get_wishlist_items(user_id)
+    items = [dict(item) for item in await get_wishlist_items(user_id)]
     if not items:
         await message.answer(
             "Your wishlist is empty right now. Send me a link to add your first item.",
@@ -1053,12 +976,10 @@ async def send_editable_wishlist(message: types.Message, user_id: int):
         )
         return
 
-    enriched_items = await enrich_wishlist_items(items)
-    await send_wishlist_gallery(message, enriched_items)
     await message.answer(
         "Tap an item to open or delete it. Send another link here to add it to your wishlist.\n\n"
         "Wishlist:",
-        reply_markup=wishlist_items_keyboard(enriched_items, editable=True),
+        reply_markup=wishlist_items_keyboard(items, editable=True),
     )
 
 
@@ -1460,17 +1381,15 @@ async def friend_wishlist_callback(callback: types.CallbackQuery):
         await callback.answer("You are no longer connected with this friend.", show_alert=True)
         return
 
-    items = await get_wishlist_items(friend_tg_id)
+    items = [dict(item) for item in await get_wishlist_items(friend_tg_id)]
     if not items:
         await callback.answer("This wishlist is empty right now.", show_alert=True)
         return
 
     await callback.answer()
-    enriched_items = await enrich_wishlist_items(items)
-    await send_wishlist_gallery(callback.message, enriched_items)
     await callback.message.answer(
         f"Wishlist for @{friend_username_raw}:",
-        reply_markup=wishlist_items_keyboard(enriched_items, editable=False),
+        reply_markup=wishlist_items_keyboard(items, editable=False),
     )
 
 
@@ -1679,7 +1598,10 @@ async def generic_handler(message: types.Message):
                 return
 
             wishlist_add_mode.discard(user_id)
-            await add_wishlist_item(user_id, text.strip())
+            url = text.strip()
+            async with aiohttp.ClientSession() as session:
+                title = await _fetch_title_for_url(session, url)
+            await add_wishlist_item(user_id, url, title)
             await message.answer(
                 "Saved to your wishlist ✅",
                 reply_markup=wishlist_keyboard(),
