@@ -1279,37 +1279,19 @@ async def friends_handler(message: types.Message):
     set_submenu(user_id, "friends")
     friend_count = await get_friend_count(user_id)
     friends = await get_friend_usernames(user_id)
-    pending_requests = await get_pending_requests_with_usernames_for_requester(user_id)
     max_friends = get_max_friends(settings, user_id)
-    header = f"You have {friend_count}/{max_friends} friends.\n\n"
-
-    if friends:
-        text = (
-            header
-            + "Tap a friend below to open their actions or choose an option to invite or remove."
-        )
-    else:
-        text = header + "You don't have any friends connected yet."
-
-    if pending_requests:
-        pending_usernames = [display_username(req["username"], "friend") for req in pending_requests]
-        pending_lines = [f"- {name}" for name in pending_usernames]
-        text += (
-            f"\n\n✉️ Pending invitations: {len(pending_requests)}\n"
-            + "\n".join(pending_lines)
-        )
-
-    text += "\n\nChoose an option below."
+    text = (
+        f"You have {friend_count}/{max_friends} friends.\n\n"
+        "Tap a friend to open their actions:"
+    )
     add_friend_mode.discard(user_id)
     remove_friend_mode.discard(user_id)
     remove_friend_confirmations.pop(user_id, None)
-    await message.answer(text, parse_mode="Markdown", reply_markup=friends_keyboard())
-
-    if friends:
-        await message.answer(
-            "Tap a friend to open their actions:",
-            reply_markup=friend_list_keyboard(friends),
-        )
+    await message.answer(
+        text,
+        parse_mode="Markdown",
+        reply_markup=friend_list_keyboard(friends) if friends else None,
+    )
 
 
 @dp.message(F.text == "➖ Remove")
