@@ -104,13 +104,28 @@ Submenu = Literal[
 ]
 current_submenu: dict[int, list[Submenu]] = {}
 
+SUBMENU_PARENTS: dict[Submenu, Submenu] = {
+    "friends_invite": "friends",
+    "friends_remove": "friends",
+}
+TOP_LEVEL_MENUS: set[Submenu] = {"friends", "wishlist", "help"}
+
 
 def set_submenu(user_id: int, submenu: Submenu) -> None:
-    history = current_submenu.setdefault(user_id, ["root"])
     if submenu == "root":
         current_submenu[user_id] = ["root"]
         return
 
+    if submenu in TOP_LEVEL_MENUS:
+        current_submenu[user_id] = ["root", submenu]
+        return
+
+    parent_menu = SUBMENU_PARENTS.get(submenu)
+    if parent_menu:
+        current_submenu[user_id] = ["root", parent_menu, submenu]
+        return
+
+    history = current_submenu.setdefault(user_id, ["root"])
     if history[-1] != submenu:
         history.append(submenu)
 
