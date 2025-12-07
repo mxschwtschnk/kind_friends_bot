@@ -572,7 +572,13 @@ def remove_friends_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
 
 
 def wishlist_keyboard() -> ReplyKeyboardMarkup:
-    return back_only_keyboard()
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Add link"), KeyboardButton(text="🗑 Delete item")],
+            [KeyboardButton(text="⬅️ Back")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def link_action_keyboard() -> InlineKeyboardMarkup:
@@ -865,8 +871,21 @@ def wishlist_items_keyboard(items, editable: bool) -> InlineKeyboardMarkup:
 def wishlist_item_action_keyboard(item) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🌐 Open item", url=item["url"])],
-            [InlineKeyboardButton(text="🗑 Delete", callback_data=f"wishlist_delete:{item['id']}")],
+            [InlineKeyboardButton(text="Open", url=item["url"])],
+            [InlineKeyboardButton(text="Delete", callback_data=f"wishlist_delete:{item['id']}")],
+        ]
+    )
+
+
+def wishlist_delete_confirmation_keyboard(item_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Yes, delete", callback_data=f"wishlist_delete_confirm:{item_id}"
+                )
+            ],
+            [InlineKeyboardButton(text="⬅️ Cancel", callback_data="wishlist_delete_cancel")],
         ]
     )
 # -------------------------------------------------------------------
@@ -980,8 +999,10 @@ async def help_handler(message: types.Message):
     )
 
 
-async def send_editable_wishlist(message: types.Message, user_id: int):
-    wishlist_add_mode.add(user_id)
+async def send_editable_wishlist(
+    message: types.Message, user_id: int, preface_text: str | None = None
+):
+    wishlist_add_mode.discard(user_id)
     items = [dict(item) for item in await get_wishlist_items(user_id)]
     if not items:
         await message.answer(
@@ -991,6 +1012,11 @@ async def send_editable_wishlist(message: types.Message, user_id: int):
         return
 
     await message.answer(
+        preface_text
+        or "Manage your wishlist. Use Add to save a link or Delete to remove an item.",
+        reply_markup=wishlist_keyboard(),
+    )
+    await message.answer(
         "Tap an item to open or delete it. Send another link here to add it to your wishlist.\n\n"
         "Wishlist:",
         reply_markup=wishlist_items_keyboard(items, editable=True),
@@ -999,6 +1025,7 @@ async def send_editable_wishlist(message: types.Message, user_id: int):
 
 @dp.message(F.text == "📜 Wishlist")
 async def wishlist_menu(message: types.Message):
+    wishlist_add_mode.discard(message.from_user.id)
     await send_editable_wishlist(message, message.from_user.id)
 
 
@@ -1009,6 +1036,13 @@ async def wishlist_add_prompt(message: types.Message):
     await message.answer(
         "Send me a link to add to your wishlist.",
         reply_markup=wishlist_keyboard(),
+    )
+
+
+@dp.message(F.text == "🗑 Delete item")
+async def wishlist_delete_prompt(message: types.Message):
+    await send_editable_wishlist(
+        message, message.from_user.id, preface_text="Tap an item below to delete it."
     )
 
 
@@ -1318,8 +1352,39 @@ async def wishlist_delete_callback(callback: types.CallbackQuery):
         await callback.answer("Invalid wishlist item.", show_alert=True)
         return
 
+    item = await get_wishlist_item(item_id)
+    if not item or item["owner_telegram_id"] != callback.from_user.id:
+        await callback.answer("This wishlist item is no longer available.", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(
+        "Are you sure you want to delete this wishlist item?",
+        reply_markup=wishlist_delete_confirmation_keyboard(item_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("wishlist_delete_confirm:"))
+async def wishlist_delete_confirm_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    item = await get_wishlist_item(item_id)
+    if not item or item["owner_telegram_id"] != callback.from_user.id:
+        await callback.answer("This wishlist item is no longer available.", show_alert=True)
+        return
+
     await delete_wishlist_item(callback.from_user.id, item_id)
     await callback.answer("Wishlist item deleted.")
+    await send_editable_wishlist(callback.message, callback.from_user.id)
+
+
+@dp.callback_query(F.data == "wishlist_delete_cancel")
+async def wishlist_delete_cancel_callback(callback: types.CallbackQuery):
+    await callback.answer("Deletion cancelled.")
     await send_editable_wishlist(callback.message, callback.from_user.id)
 
 
