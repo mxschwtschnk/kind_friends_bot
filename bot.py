@@ -1034,8 +1034,7 @@ async def how_to_handler(message: types.Message):
         "• If they don’t, you’ll receive an invite message + link that you can forward.\n"
         "• You can have up to 15 friends connected.\n\n"
         "4️⃣ Removing friends\n"
-        "• Use “👥 Friends → ➖ Remove”,\n"
-        "or send -@username directly in the chat.\n"
+        "• Use “👥 Friends → ➖ Remove” and tap a friend from the list.\n"
         "• Removing a friend stops future link sharing, but past messages stay in their chat.\n\n"
         "5️⃣ Pause / Resume\n"
         "• Tap “⏸ Pause” to stop sending and receiving links.\n"
@@ -1659,7 +1658,6 @@ async def generic_handler(message: types.Message):
     """
     Generic handler:
     - add friend by @username (with invite fallback)
-    - remove friend via -@username
     - send links to friends or store for paused friends
     - fallback text
     """
@@ -1906,46 +1904,9 @@ async def generic_handler(message: types.Message):
 
         # 1.5) Remove friend mode
         if user_id in remove_friend_mode:
-            remove_friend_mode.discard(user_id)
-            friend_username_raw = normalize_username_input(text)
-            if not friend_username_raw:
-                await message.answer(
-                    "Please send a valid @username to remove a friend.",
-                    reply_markup=friends_keyboard(),
-                )
-                return
-
-            friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-            if not friend_tg_id:
-                await message.answer(
-                    "I can't find this friend in Kind Friends.",
-                    reply_markup=friends_keyboard(),
-                )
-                return
-
-            await remove_friendship(user_id, friend_tg_id)
-            await notify_friend_removed(user_id, friend_tg_id)
             await message.answer(
-                f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
-                reply_markup=friends_keyboard(),
-            )
-            return
-
-        # 2) Remove friend: -@username
-        if text.startswith("-@"):
-            friend_username_raw = normalize_username_input(text[2:])
-            if not friend_username_raw:
-                await message.answer("Please send a valid @username to remove a friend.")
-                return
-            friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-            if not friend_tg_id:
-                await message.answer("I can't find this friend in Kind Friends.")
-                return
-
-            await remove_friendship(user_id, friend_tg_id)
-            await notify_friend_removed(user_id, friend_tg_id)
-            await message.answer(
-                f"You are no longer connected with {friend_username_raw} on Kind Friends."
+                "Tap a friend in the Remove menu to delete them, or tap ↩️ Back to exit.",
+                reply_markup=back_only_keyboard(),
             )
             return
 
