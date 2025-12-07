@@ -94,7 +94,7 @@ friend_card_remove_confirmations: dict[int, str] = {}
 feedback_mode = set()  # user_ids who are sending feedback
 delete_account_confirmation = set()  # user_ids awaiting delete confirmation
 wishlist_add_mode = set()  # user_ids adding wishlist entries
-wishlist_delete_confirmations: dict[int, int] = {}  # user -> wishlist item awaiting confirm
+wishlist_delete_confirmations: dict[int, tuple[int, int]] = {}  # user -> (wishlist item, message id)
 pending_link_actions: dict[int, list[str]] = {}  # links sent by user waiting for action
 Submenu = Literal[
     "root",
@@ -659,6 +659,7 @@ def wishlist_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Add link"), KeyboardButton(text="🗑 Delete item")],
+            [KeyboardButton(text="👀 Show my list")],
             [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
@@ -1093,14 +1094,6 @@ def wishlist_delete_confirmation_keyboard(item_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def wishlist_show_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Show my List", callback_data="wishlist_show")]
-        ]
-    )
-
-
 def wishlist_item_delete_button(item_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Delete", callback_data=f"wishlist_delete:{item_id}")]]
@@ -1145,15 +1138,33 @@ async def _confirm_or_delete_wishlist_item(
         return
 
     delete_mode = get_submenu(callback.from_user.id) == "wishlist_delete"
+    saved_confirmation = wishlist_delete_confirmations.pop(callback.from_user.id, None)
 
     if delete_mode or callback.data.startswith("wishlist_delete_confirm:"):
         await delete_wishlist_item(callback.from_user.id, item_id)
-        wishlist_delete_confirmations.pop(callback.from_user.id, None)
-        await _remove_wishlist_item_button(callback.message, item_id)
+        target_message_id = None
+        if saved_confirmation and isinstance(saved_confirmation, tuple):
+            _, target_message_id = saved_confirmation
+
+        if not target_message_id:
+            target_message_id = callback.message.message_id
+
+        try:
+            await bot.delete_message(callback.message.chat.id, target_message_id)
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] Failed to delete wishlist item message {target_message_id}: {e}")
+            await _remove_wishlist_item_button(callback.message, item_id)
+
+        if callback.message.message_id != target_message_id:
+            try:
+                await callback.message.delete()
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] Failed to delete wishlist confirmation message: {e}")
+
         await callback.answer("Wishlist item deleted.")
         return
 
-    wishlist_delete_confirmations[callback.from_user.id] = item_id
+    wishlist_delete_confirmations[callback.from_user.id] = (item_id, callback.message.message_id)
     await callback.message.answer(
         f"Are you sure you want to delete this wishlist item?\n{item['url']}",
         reply_markup=wishlist_delete_confirmation_keyboard(item_id),
@@ -1277,21 +1288,24 @@ async def send_editable_wishlist(
     user_id: int,
     preface_text: str | None = None,
     reply_markup: ReplyKeyboardMarkup | None = None,
+    show_summary: bool = True,
 ):
     wishlist_add_mode.discard(user_id)
-    items = [dict(item) for item in await get_wishlist_items(user_id)]
-    count = len(items)
-    summary = preface_text or f"You have {count} wish(es) saved."
-    await message.answer(summary, reply_markup=wishlist_show_keyboard())
-    if count == 0:
-        await message.answer(
-            "Send me a link to add your first item.",
-            reply_markup=reply_markup or wishlist_keyboard(),
-        )
+
+    if not show_summary:
         return
 
+    items = [dict(item) for item in await get_wishlist_items(user_id)]
+    count = len(items)
+    summary_line = preface_text or f"You have {count} wish(es) saved."
+
+    if count == 0:
+        summary_line += "\n\nSend me a link to add your first item."
+    else:
+        summary_line += "\n\nUse Add link to save more wishes or Delete item to remove one."
+
     await message.answer(
-        "Use Add link to save more wishes or Delete item to remove one.",
+        summary_line,
         reply_markup=reply_markup or wishlist_keyboard(),
     )
 
@@ -1358,6 +1372,13 @@ async def wishlist_add_prompt(message: types.Message):
 async def wishlist_delete_prompt(message: types.Message):
     set_submenu(message.from_user.id, "wishlist_delete")
     await send_wishlist_items(message, message.from_user.id, delete_mode=True)
+
+
+@dp.message(F.text == "👀 Show my list")
+async def wishlist_show_message(message: types.Message):
+    wishlist_add_mode.discard(message.from_user.id)
+    set_submenu(message.from_user.id, "wishlist")
+    await send_wishlist_items(message, message.from_user.id)
 
 
 @dp.message(F.text == "✏️ Edit")
@@ -2117,7 +2138,9 @@ async def link_action_wishlist(callback: types.CallbackQuery):
 
     set_submenu(callback.from_user.id, "wishlist")
     await add_links_to_wishlist(callback.from_user.id, urls, callback.message)
-    await send_editable_wishlist(callback.message, callback.from_user.id)
+    await send_editable_wishlist(
+        callback.message, callback.from_user.id, show_summary=False
+    )
     await callback.answer()
 
 
@@ -2217,7 +2240,7 @@ async def generic_handler(message: types.Message):
 
             wishlist_add_mode.discard(user_id)
             await add_links_to_wishlist(user_id, urls, message)
-            await send_editable_wishlist(message, user_id)
+            await send_editable_wishlist(message, user_id, show_summary=False)
             return
 
         # 1) Add friend mode
