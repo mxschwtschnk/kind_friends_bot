@@ -1,8 +1,11 @@
 import os
+import re
 from datetime import datetime, timedelta, timezone
 import math
+from urllib.parse import urljoin
 
 import asyncio
+import aiohttp
 from aiohttp import web
 import asyncpg
 
@@ -14,6 +17,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InputMediaPhoto,
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
@@ -568,13 +572,7 @@ def remove_friends_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
 
 
 def wishlist_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="➕ Add link"), KeyboardButton(text="✏️ Edit")],
-            [KeyboardButton(text="⬅️ Back")],
-        ],
-        resize_keyboard=True,
-    )
+    return back_only_keyboard()
 
 
 def friend_list_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
@@ -601,10 +599,87 @@ def _shorten_url(url: str, max_length: int = 32) -> str:
     return trimmed[: max_length - 1] + "…"
 
 
+async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
+    try:
+        async with session.get(
+            url,
+            timeout=10,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+                )
+            },
+        ) as response:
+            if response.status >= 400:
+                return {"title": None, "image": None}
+            content_type = response.headers.get("content-type", "")
+            if "text/html" not in content_type:
+                return {"title": None, "image": None}
+            raw_html = await response.text(errors="ignore")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to fetch metadata for {url}: {e}")
+        return {"title": None, "image": None}
+
+    html_slice = raw_html[:200000]
+
+    def _extract_attr(tag: str, attr: str) -> str | None:
+        match = re.search(rf'{attr}\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+
+    meta_tags = re.findall(r"<meta[^>]*>", html_slice, flags=re.IGNORECASE)
+    meta_map: dict[str, str] = {}
+    for tag in meta_tags:
+        name = _extract_attr(tag, "property") or _extract_attr(tag, "name")
+        content = _extract_attr(tag, "content")
+        if name and content and name.lower() not in meta_map:
+            meta_map[name.lower()] = content.strip()
+
+    def _search_meta(names: tuple[str, ...]):
+        for name in names:
+            if name.lower() in meta_map:
+                return meta_map[name.lower()]
+        return None
+
+    def _search_title_tag():
+        match = re.search(r"<title[^>]*>(.*?)</title>", html_slice, re.IGNORECASE | re.DOTALL)
+        return match.group(1).strip() if match else None
+
+    title = _search_meta(("og:title", "twitter:title", "twitter:text:title", "title")) or _search_title_tag()
+    image = _search_meta(("og:image", "twitter:image", "twitter:image:src"))
+    if image:
+        image = urljoin(url, image)
+
+    return {"title": title, "image": image}
+
+
+async def enrich_wishlist_items(items):
+    if not items:
+        return []
+
+    urls = [item["url"] for item in items]
+    async with aiohttp.ClientSession() as session:
+        tasks = [_fetch_metadata_for_url(session, url) for url in urls]
+        metadata_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+    enriched_items = []
+    for item, meta in zip(items, metadata_list):
+        meta_data = meta if isinstance(meta, dict) else {"title": None, "image": None}
+        enriched_items.append(
+            {
+                **item,
+                "title": meta_data.get("title") or _shorten_url(item["url"]),
+                "image": meta_data.get("image"),
+            }
+        )
+
+    return enriched_items
+
+
 def wishlist_items_keyboard(items, editable: bool) -> InlineKeyboardMarkup:
     buttons = []
     for item in items:
-        label = _shorten_url(item["url"])
+        label = item.get("title") or _shorten_url(item["url"])
         if editable:
             buttons.append(
                 [InlineKeyboardButton(text=label, callback_data=f"wishlist_item:{item['id']}")]
@@ -621,6 +696,24 @@ def wishlist_item_action_keyboard(item) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🗑 Delete", callback_data=f"wishlist_delete:{item['id']}")],
         ]
     )
+
+
+async def send_wishlist_gallery(message: types.Message, items):
+    media = []
+    for item in items:
+        image_url = item.get("image")
+        if not image_url:
+            continue
+        caption = item.get("title") or _shorten_url(item["url"])
+        media.append(InputMediaPhoto(media=image_url, caption=caption[:1024]))
+        if len(media) >= 10:
+            break
+
+    if media:
+        try:
+            await message.answer_media_group(media)
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] Failed to send wishlist gallery: {e}")
 
 
 # -------------------------------------------------------------------
@@ -735,31 +828,27 @@ async def help_handler(message: types.Message):
 
 
 async def send_editable_wishlist(message: types.Message, user_id: int):
+    wishlist_add_mode.add(user_id)
     items = await get_wishlist_items(user_id)
     if not items:
         await message.answer(
-            "Your wishlist is empty right now. Tap ➕ Add link to save one.",
+            "Your wishlist is empty right now. Send me a link to add your first item.",
             reply_markup=wishlist_keyboard(),
         )
         return
 
+    enriched_items = await enrich_wishlist_items(items)
+    await send_wishlist_gallery(message, enriched_items)
     await message.answer(
-        "Your wishlist items are below. Tap one to open or delete it.",
-        reply_markup=wishlist_keyboard(),
-    )
-    await message.answer(
+        "Tap an item to open or delete it. Send another link here to add it to your wishlist.\n\n"
         "Wishlist:",
-        reply_markup=wishlist_items_keyboard(items, editable=True),
+        reply_markup=wishlist_items_keyboard(enriched_items, editable=True),
     )
 
 
 @dp.message(F.text == "📜 Wishlist")
 async def wishlist_menu(message: types.Message):
-    wishlist_add_mode.discard(message.from_user.id)
-    await message.answer(
-        "Manage your wishlist. Choose an option below.",
-        reply_markup=wishlist_keyboard(),
-    )
+    await send_editable_wishlist(message, message.from_user.id)
 
 
 @dp.message(F.text == "➕ Add link")
@@ -1161,9 +1250,11 @@ async def friend_wishlist_callback(callback: types.CallbackQuery):
         return
 
     await callback.answer()
+    enriched_items = await enrich_wishlist_items(items)
+    await send_wishlist_gallery(callback.message, enriched_items)
     await callback.message.answer(
         f"Wishlist for @{friend_username_raw}:",
-        reply_markup=wishlist_items_keyboard(items, editable=False),
+        reply_markup=wishlist_items_keyboard(enriched_items, editable=False),
     )
 
 
