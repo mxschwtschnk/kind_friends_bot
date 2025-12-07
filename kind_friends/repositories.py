@@ -85,6 +85,10 @@ class Database:
                     owner_telegram_id BIGINT NOT NULL,
                     url TEXT NOT NULL,
                     title TEXT,
+                    shop TEXT,
+                    product_name TEXT,
+                    price TEXT,
+                    image_url TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 """
@@ -93,6 +97,34 @@ class Database:
                 """
                 ALTER TABLE wishlists
                 ADD COLUMN IF NOT EXISTS title TEXT;
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE wishlists
+                ADD COLUMN IF NOT EXISTS shop TEXT,
+                ADD COLUMN IF NOT EXISTS product_name TEXT,
+                ADD COLUMN IF NOT EXISTS price TEXT,
+                ADD COLUMN IF NOT EXISTS image_url TEXT;
+                """
+            )
+            await conn.execute(
+                """
+                UPDATE wishlists
+                SET
+                    product_name = COALESCE(product_name, title),
+                    shop = COALESCE(
+                        shop,
+                        NULLIF(
+                            split_part(
+                                regexp_replace(url, '^https?://(www\\.)?', ''),
+                                '/',
+                                1
+                            ),
+                            ''
+                        )
+                    )
+                WHERE product_name IS NULL OR shop IS NULL;
                 """
             )
 
@@ -578,19 +610,39 @@ class Database:
                 ids,
             )
 
-    async def add_wishlist_item(self, owner_id: int, url: str, title: str | None) -> int:
+    async def add_wishlist_item(
+        self,
+        owner_id: int,
+        url: str,
+        product_name: str | None,
+        shop: str | None = None,
+        price: str | None = None,
+        image_url: str | None = None,
+    ) -> int:
         if not self.pool:
             raise RuntimeError("Pool not initialized")
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO wishlists (owner_telegram_id, url, title)
-                VALUES ($1, $2, $3)
+                INSERT INTO wishlists (
+                    owner_telegram_id,
+                    url,
+                    title,
+                    product_name,
+                    shop,
+                    price,
+                    image_url
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id;
                 """,
                 owner_id,
                 url,
-                title,
+                product_name,
+                product_name,
+                shop,
+                price,
+                image_url,
             )
         return int(row["id"])
 
@@ -600,7 +652,16 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetch(
                 """
-                SELECT id, owner_telegram_id, url, title, created_at
+                SELECT
+                    id,
+                    owner_telegram_id,
+                    url,
+                    title,
+                    product_name,
+                    shop,
+                    price,
+                    image_url,
+                    created_at
                 FROM wishlists
                 WHERE owner_telegram_id = $1
                 ORDER BY created_at ASC;
@@ -614,7 +675,16 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(
                 """
-                SELECT id, owner_telegram_id, url, title, created_at
+                SELECT
+                    id,
+                    owner_telegram_id,
+                    url,
+                    title,
+                    product_name,
+                    shop,
+                    price,
+                    image_url,
+                    created_at
                 FROM wishlists
                 WHERE id = $1;
                 """,

@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 import math
 from typing import Literal
+from urllib.parse import urlparse
 
 import asyncio
 import aiohttp
@@ -691,6 +692,17 @@ def _shorten_url(url: str, max_length: int = 32) -> str:
     return trimmed[: max_length - 1] + "…"
 
 
+def _extract_shop_from_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc or parsed.path
+    if not host:
+        return None
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
+
+
 URL_PATTERN = re.compile(
     (
         r"https?://[^\s<>\"]+"  # full URLs with protocol
@@ -712,7 +724,14 @@ def extract_urls_from_text(text: str) -> list[str]:
     return urls
 
 
-async def _fetch_title_for_url(session, url: str) -> str | None:
+async def _fetch_link_metadata(session, url: str) -> dict[str, str | None]:
+    metadata: dict[str, str | None] = {
+        "product_name": None,
+        "shop": _extract_shop_from_url(url),
+        "price": None,
+        "image_url": None,
+    }
+
     try:
         async with session.get(
             url,
@@ -730,14 +749,14 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
             },
         ) as response:
             if response.status >= 400:
-                return None
+                return metadata
             content_type = response.headers.get("content-type", "")
             if "text/html" not in content_type:
-                return None
+                return metadata
             raw_html = await response.text(errors="ignore")
     except Exception as e:  # noqa: BLE001
         print(f"[WARN] Failed to fetch metadata for {url}: {e}")
-        return None
+        return metadata
 
     html_slice = raw_html[:200000]
 
@@ -745,15 +764,9 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
         if not title:
             return None
 
-        # Prefer the most descriptive portion (usually the product) when stores include
-        # their brand in the page title. Choose the longest non-empty chunk to avoid
-        # returning only the shop name (e.g., "Store | Product" -> "Product").
         parts = re.split(r"\s+[\-|–|—|:]\s+|\s*\|\s*|:\s*", title)
         parts = [p.strip() for p in parts if p and p.strip()]
 
-        # Filter out chunks that look like domain names or store names so that we keep
-        # the actual product title when possible (e.g., drop "Amazon.de" and keep the
-        # product description).
         store_pattern = re.compile(
             r"\b(amazon|etsy|ebay|walmart|aliexpress|target|zalando|shein|bestbuy|rakuten|mercado)\b",
             re.IGNORECASE,
@@ -771,14 +784,9 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
 
         best = max(parts, key=len).strip()
 
-        # If the best part still looks like just a store or domain (e.g., "Amazon.de"),
-        # skip it so that later fallbacks (headings or URL slug) can provide a more
-        # product-like label.
         if store_pattern.search(best) or domain_pattern.search(best):
             return None
 
-        # Skip very short leftovers such as "Home" or "Shop" that are unlikely to be
-        # the product name.
         if len(best) < 4:
             return None
 
@@ -786,7 +794,7 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
 
     def _extract_product_from_ld_json():
         scripts = re.findall(
-            r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
             html_slice,
             flags=re.IGNORECASE | re.DOTALL,
         )
@@ -812,6 +820,11 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
                     return
                 if not best or len(candidate["title"] or "") > len(best.get("title") or ""):
                     best = candidate
+                else:
+                    if not best.get("price") and candidate.get("price"):
+                        best["price"] = candidate["price"]
+                    if not best.get("image_url") and candidate.get("image_url"):
+                        best["image_url"] = candidate["image_url"]
 
             if isinstance(data, list):
                 for item in data:
@@ -821,15 +834,43 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
             elif isinstance(data, dict):
                 type_field = data.get("@type")
                 types = [type_field] if isinstance(type_field, str) else type_field or []
+                offers = data.get("offers") if isinstance(data.get("offers"), dict) else None
+
+                def _extract_price(container):
+                    if not isinstance(container, dict):
+                        return None
+                    price_val = container.get("price")
+                    currency = container.get("priceCurrency")
+                    if not price_val and isinstance(container.get("priceSpecification"), dict):
+                        price_val = container["priceSpecification"].get("price")
+                        currency = container["priceSpecification"].get("priceCurrency") or currency
+                    if price_val and currency:
+                        return f"{currency} {price_val}"
+                    return price_val
+
+                def _build_candidate(name_source: str | None):
+                    if not name_source:
+                        return None
+                    return {
+                        "title": name_source,
+                        "price": _extract_price(offers or data.get("offers")),
+                        "image_url": _normalize_image(data.get("image")),
+                    }
+
                 if any(isinstance(t, str) and t.lower() == "product" for t in types):
                     name = data.get("name") or data.get("headline")
-                    _maybe_update({"title": name})
+                    _maybe_update(_build_candidate(name))
 
                 if any(isinstance(t, str) and t.lower() == "offer" for t in types):
                     item_offered = data.get("itemOffered")
                     if isinstance(item_offered, dict):
                         name = item_offered.get("name") or item_offered.get("headline")
-                        _maybe_update({"title": name})
+                        candidate = {
+                            "title": name,
+                            "price": _extract_price(item_offered),
+                            "image_url": _normalize_image(item_offered.get("image")),
+                        }
+                        _maybe_update(candidate)
                 for value in data.values():
                     found = _walk(value)
                     if found:
@@ -847,7 +888,7 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
         return None
 
     def _extract_attr(tag: str, attr: str) -> str | None:
-        match = re.search(rf'{attr}\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        match = re.search(rf"{attr}\s*=\s*[\"']([^\"']+)[\"']", tag, re.IGNORECASE)
         return match.group(1).strip() if match else None
 
     meta_tags = re.findall(r"<meta[^>]*>", html_slice, flags=re.IGNORECASE)
@@ -859,7 +900,7 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
             or _extract_attr(tag, "itemprop")
         )
         content = _extract_attr(tag, "content")
-        if name and content and name.lower() not in meta_map:
+        if name and content:
             meta_map[name.lower()] = content.strip()
 
     def _search_img_tags():
@@ -939,20 +980,65 @@ async def _fetch_title_for_url(session, url: str) -> str | None:
     title_candidates.append(_search_heading())
     title_candidates.append(_slug_from_url())
 
-    title = None
     for candidate in title_candidates:
         cleaned = _clean_title(candidate)
         if cleaned:
-            title = cleaned
+            metadata["product_name"] = cleaned
             break
 
-    return title
+    price_candidates = [
+        structured.get("price"),
+        _search_meta(
+            (
+                "product:price:amount",
+                "og:price:amount",
+                "twitter:data1",
+                "price",
+                "price:amount",
+                "og:offer:price",
+            )
+        ),
+    ]
+
+    currency = _search_meta(
+        (
+            "product:price:currency",
+            "og:price:currency",
+            "price:currency",
+            "og:offer:price:currency",
+        )
+    )
+
+    for candidate in price_candidates:
+        if candidate:
+            metadata["price"] = (
+                f"{currency} {candidate}" if currency and currency not in str(candidate) else str(candidate)
+            )
+            break
+
+    metadata["image_url"] = structured.get("image_url") or _search_meta(
+        (
+            "og:image:secure_url",
+            "og:image",
+            "twitter:image",
+            "image",
+        )
+    )
+
+    if not metadata["image_url"]:
+        metadata["image_url"] = _search_img_tags()
+
+    return metadata
 
 
 def wishlist_items_keyboard(items, editable: bool) -> InlineKeyboardMarkup:
     buttons = []
     for item in items:
-        label = item.get("title") or _shorten_url(item["url"])
+        label = (
+            item.get("product_name")
+            or item.get("title")
+            or _shorten_url(item["url"])
+        )
         if editable:
             buttons.append(
                 [InlineKeyboardButton(text=label, callback_data=f"wishlist_item:{item['id']}")]
@@ -1904,9 +1990,16 @@ async def link_action_wishlist(callback: types.CallbackQuery):
         return
 
     async with aiohttp.ClientSession() as session:
-        title = await _fetch_title_for_url(session, url)
+        metadata = await _fetch_link_metadata(session, url)
     set_submenu(callback.from_user.id, "wishlist")
-    await add_wishlist_item(callback.from_user.id, url, title)
+    await add_wishlist_item(
+        callback.from_user.id,
+        url,
+        metadata.get("product_name"),
+        metadata.get("shop"),
+        metadata.get("price"),
+        metadata.get("image_url"),
+    )
     await callback.message.answer(
         "Saved to your wishlist ✅",
         reply_markup=wishlist_keyboard(),
@@ -2002,8 +2095,15 @@ async def generic_handler(message: types.Message):
             wishlist_add_mode.discard(user_id)
             async with aiohttp.ClientSession() as session:
                 for url in urls:
-                    title = await _fetch_title_for_url(session, url)
-                    await add_wishlist_item(user_id, url, title)
+                    metadata = await _fetch_link_metadata(session, url)
+                    await add_wishlist_item(
+                        user_id,
+                        url,
+                        metadata.get("product_name"),
+                        metadata.get("shop"),
+                        metadata.get("price"),
+                        metadata.get("image_url"),
+                    )
 
             saved_count = len(urls)
             saved_text = (
