@@ -642,6 +642,27 @@ def _shorten_url(url: str, max_length: int = 32) -> str:
     return trimmed[: max_length - 1] + "…"
 
 
+URL_PATTERN = re.compile(
+    (
+        r"https?://[^\s<>\"]+"  # full URLs with protocol
+        r"|www\.[^\s<>\"]+"  # domains starting with www.
+        r"|[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}[^\s<>\"]*"  # bare domains like example.com
+    )
+)
+
+
+def extract_urls_from_text(text: str) -> list[str]:
+    urls: list[str] = []
+    for raw_url in URL_PATTERN.findall(text):
+        cleaned = raw_url.rstrip(").,!?;:\"'”’]>}]")
+        if not cleaned:
+            continue
+        if not cleaned.startswith("http://") and not cleaned.startswith("https://"):
+            cleaned = f"https://{cleaned}"
+        urls.append(cleaned)
+    return urls
+
+
 async def _fetch_title_for_url(session, url: str) -> str | None:
     try:
         async with session.get(
@@ -1826,22 +1847,27 @@ async def generic_handler(message: types.Message):
 
         # 0.2) Wishlist add mode
         if user_id in wishlist_add_mode:
-            if not (text.startswith("http://") or text.startswith("https://")):
+            urls = extract_urls_from_text(text)
+            if not urls:
                 await message.answer(
-                    "Please send a full link starting with http:// or https:// to save it to your wishlist.",
+                    "I couldn't find any links in that message. Please send at least one link to save it to your wishlist.",
                     reply_markup=wishlist_keyboard(),
                 )
                 return
 
             wishlist_add_mode.discard(user_id)
-            url = text.strip()
             async with aiohttp.ClientSession() as session:
-                title = await _fetch_title_for_url(session, url)
-            await add_wishlist_item(user_id, url, title)
-            await message.answer(
-                "Saved to your wishlist ✅",
-                reply_markup=wishlist_keyboard(),
+                for url in urls:
+                    title = await _fetch_title_for_url(session, url)
+                    await add_wishlist_item(user_id, url, title)
+
+            saved_count = len(urls)
+            saved_text = (
+                "Saved to your wishlist ✅"
+                if saved_count == 1
+                else f"Saved {saved_count} links to your wishlist ✅"
             )
+            await message.answer(saved_text, reply_markup=wishlist_keyboard())
             await send_editable_wishlist(message, user_id)
             return
 
