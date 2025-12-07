@@ -92,6 +92,7 @@ remove_friend_confirmations: dict[int, str] = {}  # user -> username awaiting co
 feedback_mode = set()  # user_ids who are sending feedback
 delete_account_confirmation = set()  # user_ids awaiting delete confirmation
 wishlist_add_mode = set()  # user_ids adding wishlist entries
+wishlist_delete_confirmations: dict[int, int] = {}  # user -> wishlist item awaiting confirm
 pending_link_actions: dict[int, str] = {}  # last link sent by user waiting for action
 Submenu = Literal[
     "root",
@@ -966,6 +967,59 @@ def wishlist_delete_confirmation_keyboard(item_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⬅️ Cancel", callback_data="wishlist_delete_cancel")],
         ]
     )
+
+
+async def _remove_wishlist_item_button(message: types.Message, item_id: int) -> None:
+    """Remove a wishlist item's button from the inline keyboard, if present."""
+
+    markup = message.reply_markup
+    target = f"wishlist_item:{item_id}"
+
+    if not markup or not markup.inline_keyboard:
+        return
+
+    new_keyboard: list[list[InlineKeyboardButton]] = []
+
+    for row in markup.inline_keyboard:
+        new_row = [button for button in row if button.callback_data != target]
+        if new_row:
+            new_keyboard.append(new_row)
+
+    try:
+        await message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=new_keyboard)
+            if new_keyboard
+            else None
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to remove wishlist item button {item_id}: {e}")
+
+
+async def _confirm_or_delete_wishlist_item(
+    callback: types.CallbackQuery, item_id: int
+) -> None:
+    """Show a confirmation alert or delete a wishlist item inline."""
+
+    item = await get_wishlist_item(item_id)
+    if not item or item["owner_telegram_id"] != callback.from_user.id:
+        wishlist_delete_confirmations.pop(callback.from_user.id, None)
+        await callback.answer("This wishlist item is no longer available.", show_alert=True)
+        return
+
+    pending_confirmation = wishlist_delete_confirmations.get(callback.from_user.id)
+
+    if pending_confirmation == item_id:
+        await delete_wishlist_item(callback.from_user.id, item_id)
+        wishlist_delete_confirmations.pop(callback.from_user.id, None)
+        await callback.answer("Wishlist item deleted.", show_alert=True)
+        await _remove_wishlist_item_button(callback.message, item_id)
+        return
+
+    wishlist_delete_confirmations[callback.from_user.id] = item_id
+    await callback.answer(
+        "Tap again to delete this wishlist item.",
+        show_alert=True,
+    )
 # -------------------------------------------------------------------
 # FEEDBACK
 # -------------------------------------------------------------------
@@ -1210,6 +1264,7 @@ async def back_to_main(message: types.Message):
         feedback_mode.discard(user_id)
         delete_account_confirmation.discard(user_id)
         wishlist_add_mode.discard(user_id)
+        wishlist_delete_confirmations.pop(user_id, None)
         await message.answer(
             "Back to the main menu.",
             reply_markup=pause_overlay_keyboard()
@@ -1227,6 +1282,7 @@ async def back_to_main(message: types.Message):
         await message.answer("Back to Friends.", reply_markup=friends_keyboard())
     elif target_menu == "wishlist":
         wishlist_add_mode.discard(user_id)
+        wishlist_delete_confirmations.pop(user_id, None)
         await message.answer("Back to Wishlist.", reply_markup=wishlist_keyboard())
     elif target_menu == "help":
         feedback_mode.discard(user_id)
@@ -1239,6 +1295,7 @@ async def back_to_main(message: types.Message):
         feedback_mode.discard(user_id)
         delete_account_confirmation.discard(user_id)
         wishlist_add_mode.discard(user_id)
+        wishlist_delete_confirmations.pop(user_id, None)
         set_submenu(user_id, "root")
         await message.answer(
             "Back to the main menu.",
@@ -1490,16 +1547,7 @@ async def wishlist_item_callback(callback: types.CallbackQuery):
         await callback.answer("Invalid wishlist item.", show_alert=True)
         return
 
-    item = await get_wishlist_item(item_id)
-    if not item or item["owner_telegram_id"] != callback.from_user.id:
-        await callback.answer("This wishlist item is no longer available.", show_alert=True)
-        return
-
-    await callback.answer()
-    await callback.message.answer(
-        "What would you like to do with this wishlist item?",
-        reply_markup=wishlist_item_action_keyboard(item),
-    )
+    await _confirm_or_delete_wishlist_item(callback, item_id)
 
 
 @dp.callback_query(F.data.startswith("wishlist_delete:"))
@@ -1510,16 +1558,7 @@ async def wishlist_delete_callback(callback: types.CallbackQuery):
         await callback.answer("Invalid wishlist item.", show_alert=True)
         return
 
-    item = await get_wishlist_item(item_id)
-    if not item or item["owner_telegram_id"] != callback.from_user.id:
-        await callback.answer("This wishlist item is no longer available.", show_alert=True)
-        return
-
-    await callback.answer()
-    await callback.message.answer(
-        "Are you sure you want to delete this wishlist item?",
-        reply_markup=wishlist_delete_confirmation_keyboard(item_id),
-    )
+    await _confirm_or_delete_wishlist_item(callback, item_id)
 
 
 @dp.callback_query(F.data.startswith("wishlist_delete_confirm:"))
@@ -1530,20 +1569,17 @@ async def wishlist_delete_confirm_callback(callback: types.CallbackQuery):
         await callback.answer("Invalid wishlist item.", show_alert=True)
         return
 
-    item = await get_wishlist_item(item_id)
-    if not item or item["owner_telegram_id"] != callback.from_user.id:
-        await callback.answer("This wishlist item is no longer available.", show_alert=True)
-        return
-
-    await delete_wishlist_item(callback.from_user.id, item_id)
-    await callback.answer("Wishlist item deleted.")
-    await send_editable_wishlist(callback.message, callback.from_user.id)
+    await _confirm_or_delete_wishlist_item(callback, item_id)
 
 
 @dp.callback_query(F.data == "wishlist_delete_cancel")
 async def wishlist_delete_cancel_callback(callback: types.CallbackQuery):
+    wishlist_delete_confirmations.pop(callback.from_user.id, None)
     await callback.answer("Deletion cancelled.")
-    await send_editable_wishlist(callback.message, callback.from_user.id)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to clear wishlist deletion prompt: {e}")
 
 
 @dp.callback_query(F.data.startswith("friend_card:"))
