@@ -84,8 +84,15 @@ class Database:
                     id SERIAL PRIMARY KEY,
                     owner_telegram_id BIGINT NOT NULL,
                     url TEXT NOT NULL,
+                    title TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE wishlists
+                ADD COLUMN IF NOT EXISTS title TEXT;
                 """
             )
 
@@ -571,18 +578,19 @@ class Database:
                 ids,
             )
 
-    async def add_wishlist_item(self, owner_id: int, url: str) -> int:
+    async def add_wishlist_item(self, owner_id: int, url: str, title: str | None) -> int:
         if not self.pool:
             raise RuntimeError("Pool not initialized")
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO wishlists (owner_telegram_id, url)
-                VALUES ($1, $2)
+                INSERT INTO wishlists (owner_telegram_id, url, title)
+                VALUES ($1, $2, $3)
                 RETURNING id;
                 """,
                 owner_id,
                 url,
+                title,
             )
         return int(row["id"])
 
@@ -592,7 +600,7 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetch(
                 """
-                SELECT id, owner_telegram_id, url, created_at
+                SELECT id, owner_telegram_id, url, title, created_at
                 FROM wishlists
                 WHERE owner_telegram_id = $1
                 ORDER BY created_at ASC;
@@ -606,7 +614,7 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(
                 """
-                SELECT id, owner_telegram_id, url, created_at
+                SELECT id, owner_telegram_id, url, title, created_at
                 FROM wishlists
                 WHERE id = $1;
                 """,
