@@ -600,6 +600,7 @@ def friends_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Invite"), KeyboardButton(text="Remove")],
+            [KeyboardButton(text="My Friends")],
             [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
@@ -655,9 +656,9 @@ def wishlist_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="My List"),
-                KeyboardButton(text="Add Link"),
-                KeyboardButton(text="Delete Item"),
+                KeyboardButton(text="My Wishes"),
+                KeyboardButton(text="Add"),
+                KeyboardButton(text="Delete"),
             ],
             [KeyboardButton(text="⬅️ Back")],
         ],
@@ -1405,7 +1406,7 @@ async def send_editable_wishlist(
     if count == 0:
         summary_line += "\n\nSend me a link to add your first item."
     else:
-        summary_line += "\n\nUse Add Link to save more wishes or Delete Item to remove one."
+        summary_line += "\n\nUse Add to save more wishes or Delete to remove one."
 
     await message.answer(
         summary_line,
@@ -1469,7 +1470,7 @@ async def wishlist_menu(message: types.Message):
     await send_editable_wishlist(message, message.from_user.id)
 
 
-@dp.message(F.text == "Add Link")
+@dp.message(F.text == "Add")
 async def wishlist_add_prompt(message: types.Message):
     user_id = message.from_user.id
     set_submenu(user_id, "wishlist_add")
@@ -1480,13 +1481,13 @@ async def wishlist_add_prompt(message: types.Message):
     )
 
 
-@dp.message(F.text == "Delete Item")
+@dp.message(F.text == "Delete")
 async def wishlist_delete_prompt(message: types.Message):
     set_submenu(message.from_user.id, "wishlist_delete")
     await send_wishlist_items(message, message.from_user.id, delete_mode=True)
 
 
-@dp.message(F.text == "My List")
+@dp.message(F.text == "My Wishes")
 async def wishlist_show_message(message: types.Message):
     wishlist_add_mode.discard(message.from_user.id)
     set_submenu(message.from_user.id, "wishlist")
@@ -1716,7 +1717,10 @@ async def friends_handler(message: types.Message):
     friend_count = await get_friend_count(user_id)
     friends = await get_friend_usernames(user_id)
     max_friends = get_max_friends(settings, user_id)
-    text = f"You have {friend_count}/{max_friends} friends."
+    text = (
+        f"You have {friend_count}/{max_friends} friends.\n\n"
+        "Use Invite to get invitation Link or Remove to unfollow your friends."
+    )
     add_friend_mode.discard(user_id)
     remove_friend_mode.discard(user_id)
     remove_friend_confirmations.pop(user_id, None)
@@ -1725,11 +1729,24 @@ async def friends_handler(message: types.Message):
         parse_mode="Markdown",
         reply_markup=friends_keyboard(),
     )
-    if friends:
-        await message.answer(
-            "Tap a friend to open their actions:",
-            reply_markup=friend_list_keyboard(friends),
-        )
+
+
+@dp.message(F.text == "My Friends")
+async def friends_list_handler(message: types.Message):
+    user_id = message.from_user.id
+    friends = await get_friend_usernames(user_id)
+    add_friend_mode.discard(user_id)
+    remove_friend_mode.discard(user_id)
+    remove_friend_confirmations.pop(user_id, None)
+
+    if not friends:
+        await message.answer("You don't have any friends connected yet.")
+        return
+
+    await message.answer(
+        "Tap a friend to open their actions:",
+        reply_markup=friend_list_keyboard(friends),
+    )
 
 
 @dp.message(F.text == "Remove")
