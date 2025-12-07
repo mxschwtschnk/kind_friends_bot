@@ -1,0 +1,28 @@
+{
+  "name": "Kind Friends Bot Dev",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+
+  "postCreateCommand": "chmod +x scripts/start_codespace.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ]
+    }
+  },
+
+  "forwardPorts": [10000],
+
+  "onCreateCommand": "pip install -r requirements.txt",
+
+  "postStartCommand": "./scripts/start_codespace.sh",
+
+  "remoteEnv": {
+    "BOT_TOKEN": "${localEnv:BOT_TOKEN}",
+    "ADMIN_ID": "${localEnv:ADMIN_ID}",
+    "BOT_USERNAME": "${localEnv:BOT_USERNAME}",
+    "DATABASE_URL": "${localEnv:DATABASE_URL}"
+  }
+}

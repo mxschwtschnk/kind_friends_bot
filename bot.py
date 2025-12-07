@@ -1,9 +1,15 @@
 import os
+import re
+import json
 from datetime import datetime, timedelta, timezone
 import math
+from typing import Literal
+from urllib.parse import urlparse
 
 import asyncio
+import aiohttp
 from aiohttp import web
+import asyncpg
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -15,39 +21,141 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-import asyncpg
 
-# -------------------------------------------------------------------
-# CONFIG
-# -------------------------------------------------------------------
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "KindFriendsBot")  # without @
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram ID
-
-MAX_FRIENDS = 15
-ADMIN_MAX_FRIENDS = 50
-MAX_DAILY_LINKS = 5
-
-feedback_recipient_raw = os.getenv("FEEDBACK_RECIPIENT_CHAT_ID")
-FEEDBACK_RECIPIENT_CHAT_ID = (
-    int(feedback_recipient_raw) if feedback_recipient_raw else ADMIN_ID
+from kind_friends.config import load_settings
+from kind_friends.repositories import Database
+from kind_friends.services.friend_service import (
+    FriendInviteDecision,
+    FriendService,
+    display_username,
+    get_max_friends,
+    normalize_username_input,
 )
+from admin_commands import register_admin_handlers
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+settings = load_settings()
 
-bot = Bot(token=BOT_TOKEN)
+BOT_USERNAME = settings.bot_username  # without @
+MAX_DAILY_LINKS = settings.max_daily_links
+ADMIN_ID = settings.admin_id
+FEEDBACK_RECIPIENT_CHAT_ID = settings.feedback_recipient_chat_id
+
+bot = Bot(token=settings.bot_token)
 dp = Dispatcher()
 
-pool: asyncpg.Pool | None = None
+database = Database(settings.database_url)
+friend_service = FriendService(database, settings)
+
+pool = database.pool
+
+get_or_create_user = database.get_or_create_user
+set_pause = database.set_pause
+is_paused = database.is_paused
+get_telegram_id_by_username = database.get_telegram_id_by_username
+add_mutual_friendship = database.add_mutual_friendship
+get_friend_usernames = database.get_friend_usernames
+get_friend_count = database.get_friend_count
+get_all_friend_ids = database.get_all_friend_ids
+remove_friendship = database.remove_friendship
+count_pending_requests_for_requester = database.count_pending_requests_for_requester
+get_pending_requests_for_requester = database.get_pending_requests_for_requester
+get_pending_requests_with_usernames_for_requester = (
+    database.get_pending_requests_with_usernames_for_requester
+)
+get_username_by_telegram_id = database.get_username_by_telegram_id
+get_all_user_ids = database.get_all_user_ids
+get_pending_friend_request = database.get_pending_friend_request
+create_friend_request = database.create_friend_request
+get_friend_request_by_id = database.get_friend_request_by_id
+delete_friend_request = database.delete_friend_request
+delete_friend_requests_for_user = database.delete_friend_requests_for_user
+save_pending_link = database.save_pending_link
+get_pending_links = database.get_pending_links
+delete_pending_link = database.delete_pending_link
+delete_pending_links_for_user = database.delete_pending_links_for_user
+increment_sent_links = database.increment_sent_links
+get_sent_link_counts = database.get_sent_link_counts
+save_sent_link_history = database.save_sent_link_history
+has_recently_sent_link = database.has_recently_sent_link
+delete_sent_link_history_for_user = database.delete_sent_link_history_for_user
+delete_user_completely = database.delete_user_completely
+increment_invite_count = database.increment_invite_count
+get_invite_count = database.get_invite_count
+clear_sent_links = database.clear_sent_links
+bulk_delete_users = database.bulk_delete_users
+add_wishlist_item = database.add_wishlist_item
+get_wishlist_items = database.get_wishlist_items
+get_wishlist_item = database.get_wishlist_item
+delete_wishlist_item = database.delete_wishlist_item
+reserve_wishlist_item = database.reserve_wishlist_item
+unreserve_wishlist_item = database.unreserve_wishlist_item
+mark_wishlist_item_gotten = database.mark_wishlist_item_gotten
 add_friend_mode = set()  # user_ids who are adding a friend
 remove_friend_mode = set()  # user_ids who are removing a friend
+remove_friend_confirmations: dict[int, str] = {}  # user -> username awaiting confirm
+friend_card_remove_confirmations: dict[int, str] = {}
 feedback_mode = set()  # user_ids who are sending feedback
 delete_account_confirmation = set()  # user_ids awaiting delete confirmation
+wishlist_add_mode = set()  # user_ids adding wishlist entries
+wishlist_delete_confirmations: dict[int, tuple[int, int]] = {}  # user -> (wishlist item, message id)
+pending_link_actions: dict[int, list[str]] = {}  # links sent by user waiting for action
+forwarded_link_collections: dict[int, list[str]] = {}  # aggregated forwarded links awaiting action
+FRIEND_REMOVE_CONFIRM_TEXT = "Yes, remove friend"
+WISHLIST_DELETE_CONFIRM_TEXT = "Yes, delete wish"
+Submenu = Literal[
+    "root",
+    "friends",
+    "friends_invite",
+    "friends_remove",
+    "help",
+    "help_feedback",
+    "wishlist",
+    "wishlist_add",
+    "wishlist_delete",
+]
+current_submenu: dict[int, list[Submenu]] = {}
+
+SUBMENU_PARENTS: dict[Submenu, Submenu] = {
+    "friends_invite": "friends",
+    "friends_remove": "friends",
+    "help_feedback": "help",
+    "wishlist_add": "wishlist",
+    "wishlist_delete": "wishlist",
+}
+TOP_LEVEL_MENUS: set[Submenu] = {"friends", "wishlist", "help"}
+
+
+def set_submenu(user_id: int, submenu: Submenu) -> None:
+    if submenu == "root":
+        current_submenu[user_id] = ["root"]
+        return
+
+    if submenu in TOP_LEVEL_MENUS:
+        current_submenu[user_id] = ["root", submenu]
+        return
+
+    parent_menu = SUBMENU_PARENTS.get(submenu)
+    if parent_menu:
+        current_submenu[user_id] = ["root", parent_menu, submenu]
+        return
+
+    history = current_submenu.setdefault(user_id, ["root"])
+    if history[-1] != submenu:
+        history.append(submenu)
+
+
+def get_submenu(user_id: int) -> Submenu:
+    return current_submenu.get(user_id, ["root"])[-1]
+
+
+def pop_submenu(user_id: int) -> Submenu:
+    history = current_submenu.get(user_id, ["root"])
+    if len(history) <= 1:
+        current_submenu[user_id] = ["root"]
+        return "root"
+
+    history.pop()
+    return history[-1]
 
 
 class LoadingIndicator:
@@ -107,265 +215,8 @@ async def init_db():
     Create connection pool and required tables.
     """
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL)
-
-    async with pool.acquire() as conn:
-        # Users table
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE NOT NULL,
-                username TEXT,
-                is_paused BOOLEAN NOT NULL DEFAULT FALSE,
-                sent_links_count BIGINT NOT NULL DEFAULT 0,
-                invites_sent_count BIGINT NOT NULL DEFAULT 0,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """
-        )
-        # Ensure sent_links_count exists for older schema
-        await conn.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS sent_links_count BIGINT NOT NULL DEFAULT 0;
-            """
-        )
-        await conn.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS invites_sent_count BIGINT NOT NULL DEFAULT 0;
-            """
-        )
-        await conn.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS sent_links_today_count INT NOT NULL DEFAULT 0;
-            """
-        )
-        await conn.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS sent_links_date DATE;
-            """
-        )
-
-        # Friendships table
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS friendships (
-                id SERIAL PRIMARY KEY,
-                user_telegram_id BIGINT NOT NULL,
-                friend_telegram_id BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (user_telegram_id, friend_telegram_id)
-            );
-            """
-        )
-
-        # Friend requests awaiting confirmation
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_friend_requests (
-                id SERIAL PRIMARY KEY,
-                requester_telegram_id BIGINT NOT NULL,
-                recipient_telegram_id BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (requester_telegram_id, recipient_telegram_id)
-            );
-            """
-        )
-
-        # Pending links for paused users
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_links (
-                id SERIAL PRIMARY KEY,
-                recipient_telegram_id BIGINT NOT NULL,
-                sender_telegram_id BIGINT NOT NULL,
-                url TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """
-        )
-
-        # Track when users last sent a specific link (spam control)
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sent_links_history (
-                sender_telegram_id BIGINT NOT NULL,
-                url TEXT NOT NULL,
-                sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (sender_telegram_id, url)
-            );
-            """
-        )
-
-
-# -------------------------------------------------------------------
-# DATABASE HELPERS
-# -------------------------------------------------------------------
-
-async def get_or_create_user(tg_id: int, username: str | None) -> bool:
-    """
-    Make sure user exists; always keep username fresh.
-    Return current is_paused flag.
-    """
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, is_paused FROM users WHERE telegram_id=$1",
-            tg_id,
-        )
-        if row:
-            await conn.execute(
-                "UPDATE users SET username=$1 WHERE telegram_id=$2",
-                username,
-                tg_id,
-            )
-            return row["is_paused"]
-
-        await conn.execute(
-            "INSERT INTO users (telegram_id, username) VALUES ($1, $2)",
-            tg_id,
-            username,
-        )
-        return False
-
-
-async def set_pause(tg_id: int, paused: bool):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id FROM users WHERE telegram_id=$1",
-            tg_id,
-        )
-        if row:
-            await conn.execute(
-                "UPDATE users SET is_paused=$1 WHERE telegram_id=$2",
-                paused,
-                tg_id,
-            )
-        else:
-            await conn.execute(
-                "INSERT INTO users (telegram_id, is_paused) VALUES ($1, $2)",
-                tg_id,
-                paused,
-            )
-
-
-async def is_paused(tg_id: int) -> bool:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT is_paused FROM users WHERE telegram_id=$1",
-            tg_id,
-        )
-    return row["is_paused"] if row else False
-
-
-async def get_telegram_id_by_username(username: str | None):
-    """
-    Find telegram_id by @username (case-insensitive).
-    """
-    if not username:
-        return None
-    username = username.lstrip("@").strip().lower()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT telegram_id FROM users WHERE LOWER(username)=$1",
-            username,
-        )
-    return row["telegram_id"] if row else None
-
-
-def normalize_username_input(raw: str) -> str:
-    """Strip formatting characters users might copy from lists."""
-    return raw.strip().lstrip("-").lstrip("@").strip()
-
-
-async def add_mutual_friendship(a_tg_id: int, b_tg_id: int):
-    """
-    Make friendship A<->B in both directions.
-    """
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO friendships (user_telegram_id, friend_telegram_id)
-            VALUES ($1, $2)
-            ON CONFLICT (user_telegram_id, friend_telegram_id) DO NOTHING;
-            """,
-            a_tg_id,
-            b_tg_id,
-        )
-        await conn.execute(
-            """
-            INSERT INTO friendships (user_telegram_id, friend_telegram_id)
-            VALUES ($1, $2)
-            ON CONFLICT (user_telegram_id, friend_telegram_id) DO NOTHING;
-            """,
-            b_tg_id,
-            a_tg_id,
-        )
-
-
-async def get_friend_usernames(tg_id: int):
-    """
-    Return list of friends' usernames for display.
-    """
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT u.username
-            FROM friendships f
-            JOIN users u ON u.telegram_id = f.friend_telegram_id
-            WHERE f.user_telegram_id = $1
-            ORDER BY u.username;
-            """,
-            tg_id,
-        )
-    return [r["username"] for r in rows if r["username"]]
-
-
-async def get_friend_count(tg_id: int) -> int:
-    async with pool.acquire() as conn:
-        return await conn.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM friendships
-            WHERE user_telegram_id = $1;
-            """,
-            tg_id,
-        )
-
-
-async def get_all_friend_ids(tg_id: int):
-    """
-    Get telegram_ids of all friends (paused or not).
-    """
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT friend_telegram_id
-            FROM friendships
-            WHERE user_telegram_id = $1;
-            """,
-            tg_id,
-        )
-    return [r["friend_telegram_id"] for r in rows]
-
-
-async def remove_friendship(a_tg_id: int, b_tg_id: int):
-    """
-    Remove friendship A-B and B-A.
-    """
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            DELETE FROM friendships
-            WHERE (user_telegram_id=$1 AND friend_telegram_id=$2)
-               OR (user_telegram_id=$2 AND friend_telegram_id=$1);
-            """,
-            a_tg_id,
-            b_tg_id,
-        )
+    await database.connect()
+    pool = database.pool
 
 
 async def notify_friend_removed(remover_id: int, friend_id: int):
@@ -424,7 +275,7 @@ async def get_pending_requests_with_usernames_for_requester(tg_id: int):
 async def notify_user_friend_pool_full_with_pending(tg_id: int):
     friend_count = await get_friend_count(tg_id)
     pending_count = await count_pending_requests_for_requester(tg_id)
-    max_friends = get_max_friends(tg_id)
+    max_friends = get_max_friends(settings, tg_id)
     if friend_count >= max_friends and pending_count:
         try:
             await bot.send_message(
@@ -449,12 +300,6 @@ async def get_all_user_ids() -> list[int]:
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT telegram_id FROM users;")
     return [row["telegram_id"] for row in rows]
-
-
-def get_max_friends(user_id: int) -> int:
-    return ADMIN_MAX_FRIENDS if user_id == ADMIN_ID else MAX_FRIENDS
-
-
 async def get_pending_friend_request(
     requester_id: int, recipient_id: int
 ) -> asyncpg.Record | None:
@@ -732,23 +577,33 @@ def display_username(username: str | None, fallback: str = "friend") -> str:
     return f"@{username}" if username else fallback
 
 def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
+    pause_button = KeyboardButton(text="▶️ Resume") if paused else KeyboardButton(text="⏸ Pause")
     if paused:
         keyboard = [
-            [KeyboardButton(text="▶️ Resume"), KeyboardButton(text="ℹ️ Help")],
+            [pause_button, KeyboardButton(text="🎁 Wishlist")],
+            [KeyboardButton(text="ℹ️ Help")],
         ]
     else:
         keyboard = [
-            [KeyboardButton(text="👥 Friends")],
-            [KeyboardButton(text="⏸ Pause"), KeyboardButton(text="ℹ️ Help")],
+            [pause_button, KeyboardButton(text="👥 Friends"), KeyboardButton(text="🎁 Wishlist")],
+            [KeyboardButton(text="ℹ️ Help")],
         ]
 
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
+def pause_overlay_keyboard() -> ReplyKeyboardMarkup:
+    return main_keyboard(True)
+
+
 def friends_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Invite"), KeyboardButton(text="➖ Remove")],
+            [
+                KeyboardButton(text="My Friends"),
+                KeyboardButton(text="Invite"),
+                KeyboardButton(text="Remove"),
+            ],
             [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
@@ -758,8 +613,11 @@ def friends_keyboard() -> ReplyKeyboardMarkup:
 def help_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📖 How to"), KeyboardButton(text="💬 Feedback")],
-            [KeyboardButton(text="🧹 Wipe Account")],
+            [
+                KeyboardButton(text="How to"),
+                KeyboardButton(text="Feedback"),
+                KeyboardButton(text="Wipe Account"),
+            ],
             [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
@@ -777,19 +635,648 @@ def back_only_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def confirmation_keyboard(
+    confirm_text: str, cancel_text: str = "Cancel"
+) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=confirm_text)],
+            [KeyboardButton(text=cancel_text)],
+        ],
+        resize_keyboard=True,
+    )
+
+
 def remove_friends_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
     buttons = [
-        [
-            InlineKeyboardButton(
-                text=f"@{username}",
-                callback_data=f"remove_friend:{username}",
-            )
-        ]
+        [InlineKeyboardButton(text=f"@{username}", callback_data=f"remove_friend:{username}")]
         for username in friends
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def wishlist_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="My Wishes"),
+                KeyboardButton(text="Add"),
+                KeyboardButton(text="Delete"),
+            ],
+            [KeyboardButton(text="⬅️ Back")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def link_action_keyboard(multiple: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="Add to 🎁", callback_data="link_action:wishlist")]
+    ]
+    if not multiple:
+        buttons[0].append(
+            InlineKeyboardButton(text="Send to 👥", callback_data="link_action:send")
+        )
+    buttons.append([InlineKeyboardButton(text="Cancel", callback_data="link_action:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _delete_link_prompt_message(message: types.Message | None) -> None:
+    if not message:
+        return
+
+    try:
+        await message.delete()
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to delete link prompt message: {e}")
+
+
+def friend_list_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"@{username}", callback_data=f"friend_card:{username}")]
+        for username in friends
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def friend_options_keyboard(username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Remove", callback_data=f"friend_remove:{username}")],
+            [InlineKeyboardButton(text="🎁 Wishlist", callback_data=f"friend_wishlist:{username}")],
+        ]
+    )
+
+
+def _shorten_url(url: str, max_length: int = 32) -> str:
+    trimmed = url.removeprefix("https://").removeprefix("http://")
+    if len(trimmed) <= max_length:
+        return trimmed
+    return trimmed[: max_length - 1] + "…"
+
+
+def _is_forwarded_message(message: types.Message) -> bool:
+    return bool(
+        message.forward_date
+        or message.forward_from
+        or message.forward_from_chat
+        or message.forward_sender_name
+        or getattr(message, "is_automatic_forward", False)
+    )
+
+
+def _deduplicate_urls(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        unique.append(url)
+    return unique
+
+
+def _extract_shop_from_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc or parsed.path
+    if not host:
+        return None
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
+
+
+URL_PATTERN = re.compile(
+    (
+        r"https?://[^\s<>\"]+"  # full URLs with protocol
+        r"|www\.[^\s<>\"]+"  # domains starting with www.
+        r"|[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}[^\s<>\"]*"  # bare domains like example.com
+    )
+)
+
+
+def extract_urls_from_text(text: str) -> list[str]:
+    urls: list[str] = []
+    for raw_url in URL_PATTERN.findall(text):
+        cleaned = raw_url.rstrip(").,!?;:\"'”’]>}]")
+        if not cleaned:
+            continue
+        if not cleaned.startswith("http://") and not cleaned.startswith("https://"):
+            cleaned = f"https://{cleaned}"
+        urls.append(cleaned)
+    return urls
+
+
+async def _fetch_link_metadata(session, url: str) -> dict[str, str | None]:
+    metadata: dict[str, str | None] = {
+        "product_name": None,
+        "shop": _extract_shop_from_url(url),
+        "price": None,
+        "image_url": None,
+    }
+
+    try:
+        async with session.get(
+            url,
+            timeout=10,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+                ),
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;"
+                    "q=0.9,image/avif,image/webp,*/*;q=0.8"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        ) as response:
+            if response.status >= 400:
+                return metadata
+            content_type = response.headers.get("content-type", "")
+            if "text/html" not in content_type:
+                return metadata
+            raw_html = await response.text(errors="ignore")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to fetch metadata for {url}: {e}")
+        return metadata
+
+    html_slice = raw_html[:200000]
+
+    def _clean_title(title: str | None) -> str | None:
+        if not title:
+            return None
+
+        parts = re.split(r"\s+[\-|–|—|:]\s+|\s*\|\s*|:\s*", title)
+        parts = [p.strip() for p in parts if p and p.strip()]
+
+        store_pattern = re.compile(
+            r"\b(amazon|etsy|ebay|walmart|aliexpress|target|zalando|shein|bestbuy|rakuten|mercado)\b",
+            re.IGNORECASE,
+        )
+        domain_pattern = re.compile(r"\b[a-z0-9-]+\.[a-z]{2,6}\b", re.IGNORECASE)
+        descriptive_parts = [
+            p for p in parts if not store_pattern.search(p) and not domain_pattern.search(p)
+        ]
+
+        if descriptive_parts:
+            parts = descriptive_parts
+
+        if not parts:
+            return title.strip()
+
+        best = max(parts, key=len).strip()
+
+        if store_pattern.search(best) or domain_pattern.search(best):
+            return None
+
+        if len(best) < 4:
+            return None
+
+        return best
+
+    def _extract_product_from_ld_json():
+        scripts = re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html_slice,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        def _normalize_image(img_val):
+            if isinstance(img_val, list):
+                if not img_val:
+                    return None
+                first = img_val[0]
+                if isinstance(first, dict):
+                    return first.get("url") or first.get("@id")
+                return first
+            if isinstance(img_val, dict):
+                return img_val.get("url") or img_val.get("@id")
+            return img_val
+
+        def _walk(data):
+            best: dict[str, str | None] | None = None
+
+            def _maybe_update(candidate: dict[str, str | None]):
+                nonlocal best
+                if not candidate or not candidate.get("title"):
+                    return
+                if not best or len(candidate["title"] or "") > len(best.get("title") or ""):
+                    best = candidate
+                else:
+                    if not best.get("price") and candidate.get("price"):
+                        best["price"] = candidate["price"]
+                    if not best.get("image_url") and candidate.get("image_url"):
+                        best["image_url"] = candidate["image_url"]
+
+            if isinstance(data, list):
+                for item in data:
+                    found = _walk(item)
+                    if found:
+                        _maybe_update(found)
+            elif isinstance(data, dict):
+                type_field = data.get("@type")
+                types = [type_field] if isinstance(type_field, str) else type_field or []
+                offers = data.get("offers") if isinstance(data.get("offers"), dict) else None
+
+                def _extract_price(container):
+                    if not isinstance(container, dict):
+                        return None
+                    price_val = container.get("price")
+                    currency = container.get("priceCurrency")
+                    if not price_val and isinstance(container.get("priceSpecification"), dict):
+                        price_val = container["priceSpecification"].get("price")
+                        currency = container["priceSpecification"].get("priceCurrency") or currency
+                    if price_val and currency:
+                        return f"{currency} {price_val}"
+                    return price_val
+
+                def _build_candidate(name_source: str | None):
+                    if not name_source:
+                        return None
+                    return {
+                        "title": name_source,
+                        "price": _extract_price(offers or data.get("offers")),
+                        "image_url": _normalize_image(data.get("image")),
+                    }
+
+                if any(isinstance(t, str) and t.lower() == "product" for t in types):
+                    name = data.get("name") or data.get("headline")
+                    _maybe_update(_build_candidate(name))
+
+                if any(isinstance(t, str) and t.lower() == "offer" for t in types):
+                    item_offered = data.get("itemOffered")
+                    if isinstance(item_offered, dict):
+                        name = item_offered.get("name") or item_offered.get("headline")
+                        candidate = {
+                            "title": name,
+                            "price": _extract_price(item_offered),
+                            "image_url": _normalize_image(item_offered.get("image")),
+                        }
+                        _maybe_update(candidate)
+                for value in data.values():
+                    found = _walk(value)
+                    if found:
+                        _maybe_update(found)
+            return best
+
+        for script in scripts:
+            try:
+                parsed = json.loads(script.strip())
+            except Exception:
+                continue
+            found = _walk(parsed)
+            if found:
+                return found
+        return None
+
+    def _extract_attr(tag: str, attr: str) -> str | None:
+        match = re.search(rf"{attr}\s*=\s*[\"']([^\"']+)[\"']", tag, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+
+    meta_tags = re.findall(r"<meta[^>]*>", html_slice, flags=re.IGNORECASE)
+    meta_map: dict[str, str] = {}
+    for tag in meta_tags:
+        name = (
+            _extract_attr(tag, "property")
+            or _extract_attr(tag, "name")
+            or _extract_attr(tag, "itemprop")
+        )
+        content = _extract_attr(tag, "content")
+        if name and content:
+            meta_map[name.lower()] = content.strip()
+
+    def _search_img_tags():
+        images = []
+        for tag in re.findall(r"<img[^>]+>", html_slice, flags=re.IGNORECASE):
+            src = (
+                _extract_attr(tag, "src")
+                or _extract_attr(tag, "data-src")
+                or _extract_attr(tag, "data-original")
+            )
+            if not src:
+                continue
+            width = _extract_attr(tag, "width")
+            height = _extract_attr(tag, "height")
+            score = 0
+            try:
+                if width:
+                    score += int(width)
+                if height:
+                    score += int(height)
+            except ValueError:
+                pass
+            if re.search(r"1200|1600|2048|_UX|_SL", src):
+                score += 500
+            images.append((score, src))
+        if not images:
+            return None
+        images.sort(key=lambda x: x[0], reverse=True)
+        return images[0][1]
+
+    def _search_meta(names: tuple[str, ...]):
+        for name in names:
+            if name.lower() in meta_map:
+                return meta_map[name.lower()]
+        return None
+
+    def _search_title_tag():
+        match = re.search(r"<title[^>]*>(.*?)</title>", html_slice, re.IGNORECASE | re.DOTALL)
+        return match.group(1).strip() if match else None
+
+    def _search_heading():
+        match = re.search(r"<h1[^>]*>(.*?)</h1>", html_slice, re.IGNORECASE | re.DOTALL)
+        return match.group(1).strip() if match else None
+
+    def _slug_from_url():
+        try:
+            path = re.sub(r"[?#].*$", "", url)
+            segments = [s for s in path.split("/") if s and not re.match(r"https?", s, re.I)]
+            candidates = []
+            for seg in segments[::-1]:
+                cleaned = re.sub(r"[-_]+", " ", seg)
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                if len(cleaned) >= 8 and re.search(r"[A-Za-z]", cleaned):
+                    candidates.append(cleaned)
+            return candidates[0] if candidates else None
+        except Exception:
+            return None
+
+    structured = _extract_product_from_ld_json() or {}
+
+    title_candidates = [structured.get("title")]
+    title_candidates.append(
+        _search_meta(
+            (
+                "og:title",
+                "twitter:title",
+                "twitter:text:title",
+                "product:title",
+                "title",
+                "name",
+                "itemprop:title",
+                "itemprop:name",
+            )
+        )
+    )
+    title_candidates.append(_search_title_tag())
+    title_candidates.append(_search_heading())
+    title_candidates.append(_slug_from_url())
+
+    for candidate in title_candidates:
+        cleaned = _clean_title(candidate)
+        if cleaned:
+            metadata["product_name"] = cleaned
+            break
+
+    price_candidates = [
+        structured.get("price"),
+        _search_meta(
+            (
+                "product:price:amount",
+                "og:price:amount",
+                "twitter:data1",
+                "price",
+                "price:amount",
+                "og:offer:price",
+            )
+        ),
+    ]
+
+    currency = _search_meta(
+        (
+            "product:price:currency",
+            "og:price:currency",
+            "price:currency",
+            "og:offer:price:currency",
+        )
+    )
+
+    for candidate in price_candidates:
+        if candidate:
+            metadata["price"] = (
+                f"{currency} {candidate}" if currency and currency not in str(candidate) else str(candidate)
+            )
+            break
+
+    metadata["image_url"] = structured.get("image_url") or _search_meta(
+        (
+            "og:image:secure_url",
+            "og:image",
+            "twitter:image",
+            "image",
+        )
+    )
+
+    if not metadata["image_url"]:
+        metadata["image_url"] = _search_img_tags()
+
+    return metadata
+
+
+def wishlist_items_keyboard(items, editable: bool) -> InlineKeyboardMarkup:
+    buttons = []
+    for item in items:
+        label = (
+            item.get("product_name")
+            or item.get("title")
+            or _shorten_url(item["url"])
+        )
+        if editable:
+            buttons.append(
+                [InlineKeyboardButton(text=label, callback_data=f"wishlist_item:{item['id']}")]
+            )
+        else:
+            buttons.append([InlineKeyboardButton(text=label, url=item["url"])])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _remove_wishlist_item_button(message: types.Message, item_id: int) -> None:
+    """Remove a wishlist item's button from the inline keyboard, if present."""
+
+    markup = message.reply_markup
+    target = f"wishlist_item:{item_id}"
+
+    if not markup or not markup.inline_keyboard:
+        return
+
+    new_keyboard: list[list[InlineKeyboardButton]] = []
+
+    for row in markup.inline_keyboard:
+        new_row = [button for button in row if button.callback_data != target]
+        if new_row:
+            new_keyboard.append(new_row)
+
+    try:
+        await message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=new_keyboard)
+            if new_keyboard
+            else None
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to remove wishlist item button {item_id}: {e}")
+
+
+def _wishlist_item_text(item, viewer_id: int) -> str:
+    prefix = None
+    reserver = item.get("reserved_by_telegram_id")
+    if reserver:
+        prefix = "(Reserved by me)" if reserver == viewer_id else "(Reserved by friend)"
+
+    base = item.get("url") or ""
+    if prefix:
+        return f"{prefix} {base}"
+    return base
+
+
+def wishlist_item_keyboard(item, viewer_id: int, is_owner: bool) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    reserved_by = item.get("reserved_by_telegram_id")
+
+    if is_owner:
+        if reserved_by is None:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Delete", callback_data=f"wishlist_delete:{item['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        text="Reserve", callback_data=f"wishlist_reserve:{item['id']}"
+                    ),
+                ]
+            )
+        elif reserved_by == viewer_id:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Got it!", callback_data=f"wishlist_got:{item['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        text="Unreserve", callback_data=f"wishlist_unreserve:{item['id']}"
+                    ),
+                ]
+            )
+        else:
+            buttons.append(
+                [InlineKeyboardButton(text="Got it!", callback_data=f"wishlist_got:{item['id']}")]
+            )
+    else:
+        if reserved_by == viewer_id:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Unreserve", callback_data=f"wishlist_unreserve:{item['id']}"
+                    )
+                ]
+            )
+        else:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Reserve", callback_data=f"wishlist_reserve:{item['id']}"
+                    )
+                ]
+            )
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _confirm_or_delete_wishlist_item(
+    callback: types.CallbackQuery, item_id: int
+) -> None:
+    """Show a confirmation alert or delete a wishlist item inline."""
+
+    item = await get_wishlist_item(item_id)
+    if not item or item["owner_telegram_id"] != callback.from_user.id:
+        wishlist_delete_confirmations.pop(callback.from_user.id, None)
+        await callback.answer("This wishlist item is no longer available.", show_alert=True)
+        return
+
+    if item.get("reserved_by_telegram_id"):
+        await callback.answer(
+            "This wishlist item is reserved and cannot be deleted right now.",
+            show_alert=True,
+        )
+        return
+
+    wishlist_delete_confirmations.pop(callback.from_user.id, None)
+    wishlist_delete_confirmations[callback.from_user.id] = (item_id, callback.message.message_id)
+    await callback.message.answer(
+        f"Are you sure you want to delete this wishlist item?\n{item['url']}",
+        reply_markup=confirmation_keyboard(WISHLIST_DELETE_CONFIRM_TEXT),
+        disable_web_page_preview=True,
+    )
+    await callback.answer()
+
+
+async def _delete_wishlist_item_from_confirmation(message: types.Message) -> None:
+    user_id = message.from_user.id
+    saved_confirmation = wishlist_delete_confirmations.pop(user_id, None)
+
+    if not saved_confirmation:
+        await message.answer(
+            "No wishlist item is pending deletion.", reply_markup=wishlist_keyboard()
+        )
+        return
+
+    if isinstance(saved_confirmation, tuple):
+        item_id, target_message_id = saved_confirmation
+    else:
+        item_id = int(saved_confirmation)
+        target_message_id = None
+
+    item = await get_wishlist_item(item_id)
+    if not item or item.get("owner_telegram_id") != user_id:
+        await message.answer(
+            "This wishlist item is no longer available.",
+            reply_markup=wishlist_keyboard(),
+        )
+        return
+
+    if item.get("reserved_by_telegram_id"):
+        await message.answer(
+            "You can't delete this wish because it is reserved.",
+            reply_markup=wishlist_keyboard(),
+        )
+        return
+
+    await delete_wishlist_item(user_id, item_id)
+
+    if not target_message_id:
+        target_message_id = message.message_id
+
+    try:
+        await bot.delete_message(message.chat.id, target_message_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to delete wishlist item message {target_message_id}: {e}")
+        await _remove_wishlist_item_button(message, item_id)
+
+    reply_markup = (
+        back_only_keyboard()
+        if get_submenu(user_id) == "wishlist_delete"
+        else wishlist_keyboard()
+    )
+
+    await message.answer("Wishlist item deleted.", reply_markup=reply_markup)
+
+    if get_submenu(user_id) == "wishlist_delete":
+        await send_wishlist_items(message, user_id, delete_mode=True)
+
+
+async def _get_visible_wishlist_item(item_id: int, viewer_id: int):
+    item = await get_wishlist_item(item_id)
+    if not item:
+        return None
+
+    if item.get("got_at"):
+        return None
+
+    reserved_by = item.get("reserved_by_telegram_id")
+    if reserved_by and reserved_by != viewer_id and item.get("owner_telegram_id") != viewer_id:
+        return None
+
+    return item
 # -------------------------------------------------------------------
 # FEEDBACK
 # -------------------------------------------------------------------
@@ -832,6 +1319,7 @@ async def cmd_start(message: types.Message):
         message.from_user.id,
         message.from_user.username,
     )
+    set_submenu(message.from_user.id, "root")
 
     # Handle deep-link invitation (/start <inviter_id>)
     inviter_id: int | None = None
@@ -878,13 +1366,18 @@ async def cmd_start(message: types.Message):
     )
 
     await message.answer(
-        "Hey 👋 I help friends share their links and content to support each other with likes, shares, and comments.\n\n"
-        "• Create your circle of friends (up to 15)\n"
-        "• Paste a link here and I will share it with your circle.\n"
-        "• Use the buttons to open Friends, Pause/Resume, or get more information in Help.\n\n"
+        "Hey 👋 \n"
+        "I help to connect friends to support each other.\n\n"
+        "What you can do here:\n"
+        "• Create your circle of friends (up to 15).\n"
+        "• Share any link (your post, podcast, article, video or stream) and your friends instantly get it.\n"
+        "• Add any product's link to your personal Wishlist.\n"
+        "• Look up for your friends' Wishes.\n"
+        "• Anti-spam limits (5 links/day + 7-day cooldown per link).\n\n"
+        "Just send me a link — I handle the rest.\n\n"
         "*This is an MVP version. Your feedback is very welcome!*\n"
         + invite_note,
-        reply_markup=main_keyboard(paused),
+        reply_markup=pause_overlay_keyboard() if paused else main_keyboard(False),
     )
 
 
@@ -895,45 +1388,161 @@ async def start_text_handler(message: types.Message):
 
 @dp.message(F.text == "ℹ️ Help")
 async def help_handler(message: types.Message):
+    set_submenu(message.from_user.id, "help")
     await message.answer(
         "Pick a help option:",
         reply_markup=help_keyboard(),
     )
 
 
-@dp.message(F.text == "📖 How to")
+async def send_editable_wishlist(
+    message: types.Message,
+    user_id: int,
+    preface_text: str | None = None,
+    reply_markup: ReplyKeyboardMarkup | None = None,
+    show_summary: bool = True,
+):
+    wishlist_add_mode.discard(user_id)
+
+    if not show_summary:
+        return
+
+    items = [dict(item) for item in await get_wishlist_items(user_id)]
+    count = len(items)
+    summary_line = preface_text or f"You have {count} wish(es) saved."
+
+    if count == 0:
+        summary_line += "\n\nSend me a link to add your first item."
+    else:
+        summary_line += "\n\nUse Add to save more wishes or Delete to remove one."
+
+    await message.answer(
+        summary_line,
+        reply_markup=reply_markup or wishlist_keyboard(),
+    )
+
+
+async def send_wishlist_items(
+    message: types.Message,
+    user_id: int,
+    delete_mode: bool = False,
+    viewer_id: int | None = None,
+) -> None:
+    viewer_id = viewer_id or user_id
+    is_owner = user_id == viewer_id
+    items = [dict(item) for item in await get_wishlist_items(user_id, viewer_id)]
+    if not items:
+        if is_owner:
+            await message.answer(
+                "Your wishlist is empty right now. Send me a link to add your first item.",
+                reply_markup=wishlist_keyboard(),
+            )
+        else:
+            await message.answer("This wishlist is empty right now.")
+        return
+
+    if delete_mode:
+        await message.answer(
+            "Delete mode: tap Delete below any item, then confirm using the keyboard.",
+            reply_markup=back_only_keyboard(),
+        )
+
+    for item in items:
+        await message.answer(
+            _wishlist_item_text(item, viewer_id),
+            reply_markup=wishlist_item_keyboard(item, viewer_id, is_owner=is_owner),
+        )
+
+
+async def add_links_to_wishlist(
+    user_id: int, urls: list[str], message: types.Message
+) -> None:
+    saved: list[tuple[int, str]] = []
+    for url in urls:
+        item_id = await add_wishlist_item(user_id, url)
+        saved.append((item_id, url))
+
+    for idx, (item_id, url) in enumerate(saved):
+        prefix = "Saved to your wishlist ✅\n" if idx == 0 else ""
+        item = await get_wishlist_item(item_id)
+        await message.answer(
+            f"{prefix}{_wishlist_item_text(item, user_id)}",
+            reply_markup=wishlist_item_keyboard(item, user_id, is_owner=True),
+        )
+
+
+@dp.message(F.text == "🎁 Wishlist")
+async def wishlist_menu(message: types.Message):
+    wishlist_add_mode.discard(message.from_user.id)
+    set_submenu(message.from_user.id, "wishlist")
+    await send_editable_wishlist(message, message.from_user.id)
+
+
+@dp.message(F.text == "Add")
+async def wishlist_add_prompt(message: types.Message):
+    user_id = message.from_user.id
+    set_submenu(user_id, "wishlist_add")
+    wishlist_add_mode.add(user_id)
+    await message.answer(
+        "Send me a link to add to your wishlist.",
+        reply_markup=back_only_keyboard(),
+    )
+
+
+@dp.message(F.text == "Delete")
+async def wishlist_delete_prompt(message: types.Message):
+    set_submenu(message.from_user.id, "wishlist_delete")
+    await send_wishlist_items(message, message.from_user.id, delete_mode=True)
+
+
+@dp.message(F.text == "My Wishes")
+async def wishlist_show_message(message: types.Message):
+    wishlist_add_mode.discard(message.from_user.id)
+    set_submenu(message.from_user.id, "wishlist")
+    await send_wishlist_items(message, message.from_user.id)
+
+
+@dp.message(F.text == "✏️ Edit")
+async def wishlist_edit(message: types.Message):
+    if await is_paused(message.from_user.id):
+        await message.answer(
+            "You are currently on pause. Tap ▶️ Resume to edit your wishlist.",
+            reply_markup=pause_overlay_keyboard(),
+        )
+        return
+
+    await send_editable_wishlist(message, message.from_user.id)
+
+
+@dp.message(F.text == "How to")
 async def how_to_handler(message: types.Message):
     await message.answer(
-        "This should be a message under How to\n\n"
-        "1️⃣ Sharing links\n"
-        "• Paste any http(s) link into the chat.\n"
-        "• I send it to all your connected friends who are not on pause.\n"
-        "• Friends who are on pause get your links later in a digest when they resume.\n\n"
-        "2️⃣ Daily limits & anti-spam\n"
-        "• You can share up to 5 links per day.\n"
-        "• The same exact link can only be sent again after 7 days (to avoid spam).\n\n"
-        "3️⃣ Adding friends\n"
-        "• Tap “👥 Friends →➕ Invite” and send your friend’s @username.\n"
-        "• If they already use Kind Friends, they get a request to connect.\n"
-        "• If they don’t, you’ll receive an invite message + link that you can forward.\n"
-        "• You can have up to 15 friends connected.\n\n"
-        "4️⃣ Removing friends\n"
-        "• Use “👥 Friends → ➖ Remove”,\n"
-        "or send -@username directly in the chat.\n"
-        "• Removing a friend stops future link sharing, but past messages stay in their chat.\n\n"
+        "1️⃣ Share links\n"
+        "• Paste any link — choose to send, wishlist.\n"
+        "• If “Send” active friends get it instantly; paused friends get it when they return.\n\n"
+        "2️⃣ Wishlist\n"
+        "• If “Wishlist” you save links for later in 🎁 Wishlist.\n"
+        "• View, edit, or delete items anytime. Browse your friends’ Wishlists.\n\n"
+        "3️⃣ Anti-spam Limits\n"
+        "• Up to 5 links/day.\n"
+        "• Same link: 7-day cooldown.\n"
+        "• If your friend list is full, I’ll warn you about new incoming invites.\n\n"
+        "4️⃣ Friends\n"
+        "• Add friends via \"👥 Friends → Invite\".\n"
+        "• Unfollow via \"👥 Friends → Remove\" or from a friend’s card.\n"
+        "• Existing users get a request; new users give you a forwardable invite link.\n"
+        "• Max 15 friends.\n\n"
         "5️⃣ Pause / Resume\n"
-        "• Tap “⏸ Pause” to stop sending and receiving links.\n"
-        "• While paused, your friends’ links are stored for you.\n"
-        "• Tap “▶️ Resume” to become active again and get a summary of links you missed.\n\n"
-        "6️⃣ Wipe account\n"
-        "• Tap “🧹 Wipe Account” to delete your Kind Friends account, friendships,\n"
-        "and stored pending links.\n"
-        "• Already delivered messages in other chats can’t be removed.",
+        "• Pause stops sending & receiving; links are saved for later.\n"
+        "• Resume gives you a quick digest of what you missed.\n\n"
+        "7️⃣ Wipe account\n"
+        "• Deletes your data, friendships, requests, wishlist & stored links.\n"
+        "• Sent messages in chats can’t be removed.",
         reply_markup=help_keyboard(),
     )
 
 
-@dp.message(F.text == "🧹 Wipe Account")
+@dp.message(F.text == "Wipe Account")
 async def delete_account_prompt(message: types.Message):
     user_id = message.from_user.id
     delete_account_confirmation.add(user_id)
@@ -950,26 +1559,68 @@ async def delete_account_prompt(message: types.Message):
     )
 
 
-@dp.message(F.text == "💬 Feedback")
+@dp.message(F.text == "Feedback")
 async def start_feedback_from_menu(message: types.Message):
+    set_submenu(message.from_user.id, "help_feedback")
     feedback_mode.add(message.from_user.id)
     await message.answer(
         "Thanks for willing to share feedback!\nSend your thoughts in one message and I'll pass it along.",
-        reply_markup=feedback_keyboard(),
+        reply_markup=back_only_keyboard(),
     )
 
 
 @dp.message(F.text == "⬅️ Back")
 async def back_to_main(message: types.Message):
-    user_paused = await is_paused(message.from_user.id)
-    add_friend_mode.discard(message.from_user.id)
-    remove_friend_mode.discard(message.from_user.id)
-    feedback_mode.discard(message.from_user.id)
-    delete_account_confirmation.discard(message.from_user.id)
-    await message.answer(
-        "Back to the main menu.",
-        reply_markup=main_keyboard(user_paused),
-    )
+    user_id = message.from_user.id
+    user_paused = await is_paused(user_id)
+    current_menu = get_submenu(user_id)
+
+    if current_menu == "root":
+        add_friend_mode.discard(user_id)
+        remove_friend_mode.discard(user_id)
+        remove_friend_confirmations.pop(user_id, None)
+        feedback_mode.discard(user_id)
+        delete_account_confirmation.discard(user_id)
+        wishlist_add_mode.discard(user_id)
+        wishlist_delete_confirmations.pop(user_id, None)
+        await message.answer(
+            "Back to the main menu.",
+            reply_markup=pause_overlay_keyboard()
+            if user_paused
+            else main_keyboard(False),
+        )
+        return
+
+    target_menu = pop_submenu(user_id)
+
+    if target_menu == "friends":
+        add_friend_mode.discard(user_id)
+        remove_friend_mode.discard(user_id)
+        remove_friend_confirmations.pop(user_id, None)
+        await message.answer("Back to Friends.", reply_markup=friends_keyboard())
+    elif target_menu == "wishlist":
+        wishlist_add_mode.discard(user_id)
+        wishlist_delete_confirmations.pop(user_id, None)
+        await message.answer("Back to Wishlist.", reply_markup=wishlist_keyboard())
+    elif target_menu == "help":
+        feedback_mode.discard(user_id)
+        delete_account_confirmation.discard(user_id)
+        await message.answer("Back to Help.", reply_markup=help_keyboard())
+    else:
+        add_friend_mode.discard(user_id)
+        remove_friend_mode.discard(user_id)
+        remove_friend_confirmations.pop(user_id, None)
+        feedback_mode.discard(user_id)
+        delete_account_confirmation.discard(user_id)
+        wishlist_add_mode.discard(user_id)
+        wishlist_delete_confirmations.pop(user_id, None)
+        set_submenu(user_id, "root")
+        await message.answer(
+            "Back to the main menu.",
+            reply_markup=pause_overlay_keyboard()
+            if user_paused
+            else main_keyboard(False),
+        )
 
 
 @dp.message(F.text == "⏸ Pause")
@@ -979,13 +1630,14 @@ async def pause_handler(message: types.Message):
     """
     user_id = message.from_user.id
     await set_pause(user_id, True)
+    set_submenu(user_id, "root")
     await message.answer(
         "You are now on pause.\n\n"
         "While you’re on pause:\n"
         "• You can’t send links\n"
         "• You won’t receive new links from friends\n\n"
         "Tap ▶️ Resume when you want to come back.",
-        reply_markup=main_keyboard(True),
+        reply_markup=pause_overlay_keyboard(),
     )
 
 
@@ -996,6 +1648,7 @@ async def resume_handler(message: types.Message):
     """
     user_id = message.from_user.id
     await set_pause(user_id, False)
+    set_submenu(user_id, "root")
 
     rows = await get_pending_links_for_user(user_id)
 
@@ -1035,11 +1688,13 @@ async def resume_handler(message: types.Message):
     await message.answer(digest_text)
 
 
-@dp.message(F.text == "➕ Invite")
+@dp.message(F.text == "Invite")
 async def invite_friends_handler(message: types.Message):
     user_id = message.from_user.id
+    set_submenu(user_id, "friends_invite")
     add_friend_mode.add(user_id)
     remove_friend_mode.discard(user_id)
+    remove_friend_confirmations.pop(user_id, None)
     invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
     await message.answer(
         "Send me your friend's Telegram @username.\n"
@@ -1059,60 +1714,65 @@ async def invite_friends_handler(message: types.Message):
 async def friends_handler(message: types.Message):
     user_id = message.from_user.id
     if await is_paused(user_id):
+        set_submenu(user_id, "root")
         await message.answer(
             "You are currently on pause. Tap ▶️ Resume to manage friends again.",
-            reply_markup=main_keyboard(True),
+            reply_markup=pause_overlay_keyboard(),
         )
         return
 
+    set_submenu(user_id, "friends")
     friend_count = await get_friend_count(user_id)
     friends = await get_friend_usernames(user_id)
-    pending_requests = await get_pending_requests_with_usernames_for_requester(user_id)
-    max_friends = get_max_friends(user_id)
-    header = f"You have {friend_count}/{max_friends} friends.\n\n"
-
-    if friends:
-        lines = [f"- @{u}" for u in friends]
-        text = header + "Your friends:\n" + "\n".join(lines)
-    else:
-        text = header + "You don't have any friends connected yet."
-
-    if pending_requests:
-        pending_usernames = [display_username(req["username"], "friend") for req in pending_requests]
-        pending_lines = [f"- {name}" for name in pending_usernames]
-        text += (
-            f"\n\n✉️ Pending invitations: {len(pending_requests)}\n"
-            + "\n".join(pending_lines)
-        )
-
-    text += "\n\nChoose an option below."
+    max_friends = get_max_friends(settings, user_id)
+    text = (
+        f"You have {friend_count}/{max_friends} friends.\n\n"
+        "Use Invite to get invitation link or Remove to unfollow your friends."
+    )
     add_friend_mode.discard(user_id)
     remove_friend_mode.discard(user_id)
-    await message.answer(text, parse_mode="Markdown", reply_markup=friends_keyboard())
+    remove_friend_confirmations.pop(user_id, None)
+    await message.answer(
+        text,
+        parse_mode="Markdown",
+        reply_markup=friends_keyboard(),
+    )
 
 
-@dp.message(F.text == "➖ Remove")
+@dp.message(F.text == "My Friends")
+async def friends_list_handler(message: types.Message):
+    user_id = message.from_user.id
+    friends = await get_friend_usernames(user_id)
+    add_friend_mode.discard(user_id)
+    remove_friend_mode.discard(user_id)
+    remove_friend_confirmations.pop(user_id, None)
+
+    if not friends:
+        await message.answer("You don't have any friends connected yet.")
+        return
+
+    await message.answer(
+        "Tap a friend to open their actions:",
+        reply_markup=friend_list_keyboard(friends),
+    )
+
+
+@dp.message(F.text == "Remove")
 async def remove_friend_handler(message: types.Message):
     user_id = message.from_user.id
+    set_submenu(user_id, "friends_remove")
     friends = await get_friend_usernames(user_id)
 
     if not friends:
-        await message.answer(
-            "You don't have any friends connected yet.\n"
-            "Tap “➕ Invite” to add someone.",
-        )
+        await message.answer("You don't have any friends connected yet.")
         return
 
     remove_friend_mode.add(user_id)
     add_friend_mode.discard(user_id)
+    remove_friend_confirmations.pop(user_id, None)
+    await message.answer("Removing friends.", reply_markup=back_only_keyboard())
     await message.answer(
-        "You can now delete your friends from the list.\n"
-        "Choose one or a few by clicking on the tags below.",
-        reply_markup=back_only_keyboard(),
-    )
-    await message.answer(
-        "Tap a friend to remove them:",
-        reply_markup=remove_friends_keyboard(friends),
+        "Select a friend to remove.", reply_markup=remove_friends_keyboard(friends)
     )
 
 
@@ -1121,7 +1781,7 @@ async def remove_friend_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
     if user_id not in remove_friend_mode:
-        await callback.answer("Remove mode is closed. Tap ➖ Remove to start again.", show_alert=True)
+        await callback.answer("Remove mode is closed. Tap Remove to start again.", show_alert=True)
         return
 
     try:
@@ -1135,35 +1795,404 @@ async def remove_friend_callback(callback: types.CallbackQuery):
         await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
         return
 
+    friends = await get_friend_usernames(user_id)
+    if friend_username_raw not in friends:
+        await callback.answer("This friend is no longer available.", show_alert=True)
+        return
+
+    remove_friend_confirmations[user_id] = friend_username_raw
+    await callback.message.answer(
+        f"Remove @{friend_username_raw}?",
+        reply_markup=confirmation_keyboard(FRIEND_REMOVE_CONFIRM_TEXT),
+    )
+    await callback.answer()
+
+
+async def _finalize_friend_removal(
+    user_id: int, friend_username_raw: str, reply_target: types.Message
+) -> None:
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await reply_target.answer(
+            "I can't find this friend in Kind Friends.",
+            reply_markup=friends_keyboard(),
+        )
+        return
+
+    friends_ids = await get_all_friend_ids(user_id)
+    if friend_tg_id not in friends_ids:
+        await reply_target.answer(
+            "You are no longer connected with this friend.",
+            reply_markup=friends_keyboard(),
+        )
+        return
+
+    remove_friend_confirmations.pop(user_id, None)
+    friend_card_remove_confirmations.pop(user_id, None)
+
     await remove_friendship(user_id, friend_tg_id)
     await notify_friend_removed(user_id, friend_tg_id)
 
-    await callback.answer("Friend removed.")
+    in_remove_mode = user_id in remove_friend_mode
+    updated_friends = await get_friend_usernames(user_id)
+
+    if in_remove_mode:
+        await reply_target.answer(
+            f"Removed @{friend_username_raw}.",
+            reply_markup=back_only_keyboard(),
+        )
+        if updated_friends:
+            await reply_target.answer(
+                "Select a friend to remove.",
+                reply_markup=remove_friends_keyboard(updated_friends),
+            )
+        else:
+            remove_friend_mode.discard(user_id)
+            await reply_target.answer(
+                "You have no other friends to remove.",
+                reply_markup=friends_keyboard(),
+            )
+    else:
+        set_submenu(user_id, "friends")
+        await reply_target.answer(
+            f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
+            reply_markup=friends_keyboard(),
+        )
+
+
+@dp.callback_query(F.data.startswith("remove_friend_confirm:"))
+async def remove_friend_confirm_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
+    if user_id not in remove_friend_mode:
+        await callback.answer("Remove mode is closed. Tap Remove to start again.", show_alert=True)
+        return
+
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid remove action.", show_alert=True)
+        return
+
+    pending_confirmation = remove_friend_confirmations.get(user_id)
+    if pending_confirmation != friend_username_raw:
+        await callback.answer("Please select a friend to remove first.", show_alert=True)
+        return
+    await _finalize_friend_removal(user_id, friend_username_raw, callback.message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "remove_friend_cancel")
+async def remove_friend_cancel_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
+    if user_id not in remove_friend_mode:
+        await callback.answer("Remove mode is closed. Tap Remove to start again.", show_alert=True)
+        return
+
+    remove_friend_confirmations.pop(user_id, None)
+    friends = await get_friend_usernames(user_id)
+
     await callback.message.answer(
-        f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
-        reply_markup=back_only_keyboard(),
+        "Cancelled.", reply_markup=back_only_keyboard()
+    )
+    if friends:
+        await callback.message.answer(
+            "Select a friend to remove.", reply_markup=remove_friends_keyboard(friends)
+        )
+    await callback.answer()
+
+
+@dp.message(F.text == FRIEND_REMOVE_CONFIRM_TEXT)
+async def remove_friend_from_keyboard(message: types.Message):
+    user_id = message.from_user.id
+    pending_username = remove_friend_confirmations.get(user_id) or friend_card_remove_confirmations.get(user_id)
+
+    if not pending_username:
+        await message.answer(
+            "No friend is awaiting removal.", reply_markup=friends_keyboard()
+        )
+        return
+
+    await _finalize_friend_removal(user_id, pending_username, message)
+
+
+@dp.message(F.text == "Cancel")
+async def cancel_pending_confirmation(message: types.Message):
+    user_id = message.from_user.id
+    handled = False
+
+    if remove_friend_confirmations.pop(user_id, None) or friend_card_remove_confirmations.pop(user_id, None):
+        handled = True
+        friends = await get_friend_usernames(user_id)
+        if user_id in remove_friend_mode and friends:
+            await message.answer(
+                "Cancelled.", reply_markup=back_only_keyboard()
+            )
+            await message.answer(
+                "Select a friend to remove.", reply_markup=remove_friends_keyboard(friends)
+            )
+        else:
+            await message.answer(
+                "Friend removal cancelled.", reply_markup=friends_keyboard()
+            )
+
+    if wishlist_delete_confirmations.pop(user_id, None):
+        handled = True
+        reply_markup = (
+            back_only_keyboard()
+            if get_submenu(user_id) == "wishlist_delete"
+            else wishlist_keyboard()
+        )
+        await message.answer("Deletion cancelled.", reply_markup=reply_markup)
+
+    if not handled:
+        await message.answer("Nothing to cancel.")
+
+
+@dp.callback_query(F.data.startswith("wishlist_item:"))
+async def wishlist_item_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    await _confirm_or_delete_wishlist_item(callback, item_id)
+
+
+@dp.callback_query(F.data.startswith("wishlist_delete:"))
+async def wishlist_delete_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    await _confirm_or_delete_wishlist_item(callback, item_id)
+
+
+async def _refresh_wishlist_message(
+    callback: types.CallbackQuery, item, is_owner: bool, viewer_id: int
+):
+    await callback.message.edit_text(
+        _wishlist_item_text(item, viewer_id),
+        reply_markup=wishlist_item_keyboard(item, viewer_id, is_owner=is_owner),
+        disable_web_page_preview=False,
     )
 
-    updated_friends = await get_friend_usernames(user_id)
-    if updated_friends:
-        try:
-            await callback.message.edit_reply_markup(
-                reply_markup=remove_friends_keyboard(updated_friends)
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"[WARN] Failed to refresh removal keyboard for {user_id}: {e}")
-    else:
-        remove_friend_mode.discard(user_id)
-        try:
-            await callback.message.edit_text(
-                "You don't have any friends connected yet.\nTap “➕ Invite” to add someone.",
-                reply_markup=None,
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"[WARN] Failed to update empty removal message for {user_id}: {e}")
+
+@dp.callback_query(F.data.startswith("wishlist_reserve:"))
+async def wishlist_reserve_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    item = await _get_visible_wishlist_item(item_id, user_id)
+    if not item:
+        await callback.answer("This wish is no longer available.", show_alert=True)
+        return
+
+    success = await reserve_wishlist_item(item_id, user_id)
+    if not success:
+        await callback.answer("Someone else already reserved this wish.", show_alert=True)
+        return
+
+    item = await get_wishlist_item(item_id)
+    await _refresh_wishlist_message(callback, item, item["owner_telegram_id"] == user_id, user_id)
+    await callback.answer("Reserved!")
+
+
+@dp.callback_query(F.data.startswith("wishlist_unreserve:"))
+async def wishlist_unreserve_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    item = await _get_visible_wishlist_item(item_id, user_id)
+    if not item:
+        await callback.answer("This wish is no longer available.", show_alert=True)
+        return
+
+    success = await unreserve_wishlist_item(item_id, user_id)
+    if not success:
+        await callback.answer("You can't unreserve this wish.", show_alert=True)
+        return
+
+    item = await get_wishlist_item(item_id)
+    await _refresh_wishlist_message(callback, item, item["owner_telegram_id"] == user_id, user_id)
+    await callback.answer("Unreserved.")
+
+
+@dp.callback_query(F.data.startswith("wishlist_got:"))
+async def wishlist_got_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    item = await get_wishlist_item(item_id)
+    if not item or item.get("owner_telegram_id") != user_id:
+        await callback.answer("This wish is not available.", show_alert=True)
+        return
+
+    success = await mark_wishlist_item_gotten(user_id, item_id)
+    if not success:
+        await callback.answer("This wish was already handled.", show_alert=True)
+        return
+
+    try:
+        await callback.message.delete()
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to delete wish message {item_id}: {e}")
+    await callback.answer("Marked as received!", show_alert=False)
+
+
+@dp.callback_query(F.data.startswith("wishlist_delete_confirm:"))
+async def wishlist_delete_confirm_callback(callback: types.CallbackQuery):
+    try:
+        item_id = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Invalid wishlist item.", show_alert=True)
+        return
+
+    await _confirm_or_delete_wishlist_item(callback, item_id)
+
+
+@dp.callback_query(F.data == "wishlist_delete_cancel")
+async def wishlist_delete_cancel_callback(callback: types.CallbackQuery):
+    wishlist_delete_confirmations.pop(callback.from_user.id, None)
+    await callback.answer("Deletion cancelled.")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to clear wishlist deletion prompt: {e}")
+
+
+@dp.message(F.text == WISHLIST_DELETE_CONFIRM_TEXT)
+async def wishlist_delete_via_keyboard(message: types.Message):
+    await _delete_wishlist_item_from_confirmation(message)
+
+
+@dp.callback_query(F.data == "wishlist_show")
+async def wishlist_show_callback(callback: types.CallbackQuery):
+    set_submenu(callback.from_user.id, "wishlist")
+    await send_wishlist_items(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("friend_card:"))
+async def friend_card_callback(callback: types.CallbackQuery):
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid friend action.", show_alert=True)
+        return
+
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
+        return
+
+    friends_ids = await get_all_friend_ids(callback.from_user.id)
+    if friend_tg_id not in friends_ids:
+        await callback.answer("You are no longer connected with this friend.", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(
+        f"What do you want to do with @{friend_username_raw}?",
+        reply_markup=friend_options_keyboard(friend_username_raw),
+    )
+
+
+@dp.callback_query(F.data.startswith("friend_remove:"))
+async def friend_remove_from_card(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid friend action.", show_alert=True)
+        return
+
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
+        return
+
+    friends_ids = await get_all_friend_ids(user_id)
+    if friend_tg_id not in friends_ids:
+        await callback.answer("You are no longer connected with this friend.", show_alert=True)
+        return
+
+    friend_card_remove_confirmations[user_id] = friend_username_raw
+    await callback.message.answer(
+        f"Are you sure you want to remove @{friend_username_raw}?",
+        reply_markup=confirmation_keyboard(FRIEND_REMOVE_CONFIRM_TEXT),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("friend_card_remove_confirm:"))
+async def friend_remove_from_card_confirm(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid friend action.", show_alert=True)
+        return
+
+    pending_username = friend_card_remove_confirmations.get(user_id)
+    if pending_username != friend_username_raw:
+        await callback.answer("Please start the removal again from the friends list.", show_alert=True)
+        return
+    await _finalize_friend_removal(user_id, friend_username_raw, callback.message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "friend_card_remove_cancel")
+async def friend_remove_from_card_cancel(callback: types.CallbackQuery):
+    friend_card_remove_confirmations.pop(callback.from_user.id, None)
+    await callback.answer("Kept your friend.")
+
+
+@dp.callback_query(F.data.startswith("friend_wishlist:"))
+async def friend_wishlist_callback(callback: types.CallbackQuery):
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid friend action.", show_alert=True)
+        return
+
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
+        return
+
+    friends_ids = await get_all_friend_ids(callback.from_user.id)
+    if friend_tg_id not in friends_ids:
+        await callback.answer("You are no longer connected with this friend.", show_alert=True)
+        return
+
+    visible_items = [dict(item) for item in await get_wishlist_items(friend_tg_id, callback.from_user.id)]
+    if not visible_items:
+        await callback.answer("This wishlist is empty right now.", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(f"Wishlist for @{friend_username_raw}:")
+    for item in visible_items:
         await callback.message.answer(
-            "Friend list is empty now. Returning to Friends menu.",
-            reply_markup=friends_keyboard(),
+            _wishlist_item_text(item, callback.from_user.id),
+            reply_markup=wishlist_item_keyboard(item, callback.from_user.id, is_owner=False),
         )
 
 
@@ -1189,8 +2218,8 @@ async def accept_friend_request(callback: types.CallbackQuery):
 
     requester_friend_count = await get_friend_count(requester_id)
     recipient_friend_count = await get_friend_count(recipient_id)
-    requester_max_friends = get_max_friends(requester_id)
-    recipient_max_friends = get_max_friends(recipient_id)
+    requester_max_friends = get_max_friends(settings, requester_id)
+    recipient_max_friends = get_max_friends(settings, recipient_id)
 
     if requester_friend_count >= requester_max_friends:
         await delete_friend_request(request_id)
@@ -1284,87 +2313,9 @@ async def start_feedback(callback: types.CallbackQuery):
     await callback.message.answer(
         "Thanks for willing to share feedback!\n"
         "Send your thoughts in one message and I'll pass it along.",
-        reply_markup=feedback_keyboard(),
+        reply_markup=help_keyboard(),
     )
     await callback.answer()
-
-
-@dp.message(F.text == "/admin")
-async def admin_handler(message: types.Message):
-    """
-    Simple admin stats, available only for ADMIN_ID.
-    """
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    async with pool.acquire() as conn:
-        users_count = await conn.fetchval("SELECT COUNT(*) FROM users;")
-        paused_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE is_paused = TRUE;"
-        )
-        friendships_count = await conn.fetchval("SELECT COUNT(*) FROM friendships;")
-        pending_count = await conn.fetchval("SELECT COUNT(*) FROM pending_links;")
-        sent_links_total = await conn.fetchval(
-            "SELECT COALESCE(SUM(sent_links_count), 0) FROM users;"
-        )
-        invites_sent_total = await conn.fetchval(
-            "SELECT COALESCE(SUM(invites_sent_count), 0) FROM users;"
-        )
-
-    text = (
-        "📊 **Kind Friends — Admin Panel**\n\n"
-        f"👥 Total users: **{users_count}**\n"
-        f"⏸ Paused users: **{paused_count}**\n"
-        f"🔗 Friend connections: **{friendships_count}**\n"
-        f"📥 Pending links (stored for paused): **{pending_count}**\n"
-        f"📤 Total links sent attempts: **{sent_links_total}**\n"
-        f"✉️ Total invites sent: **{invites_sent_total}**\n"
-    )
-
-    await message.answer(text, parse_mode="Markdown")
-
-
-@dp.message(
-    F.text.startswith("/broadcast") | F.caption.startswith("/broadcast")
-)
-async def broadcast_handler(message: types.Message):
-    """
-    Broadcast a text message to all registered users, optionally with a photo.
-    Only the configured ADMIN_ID can use this command.
-    """
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    command_payload = (message.text or message.caption or "").split(maxsplit=1)
-    if len(command_payload) < 2 or not command_payload[1].strip():
-        await message.answer(
-            "Usage: /broadcast <message to send to all users>.\n"
-            "You can attach an image to send it with the message.",
-        )
-        return
-
-    broadcast_text = command_payload[1].strip()
-    photo_id = message.photo[-1].file_id if message.photo else None
-    user_ids = await get_all_user_ids()
-
-    delivered = 0
-    failed = 0
-
-    for user_id in user_ids:
-        try:
-            if photo_id:
-                await bot.send_photo(user_id, photo_id, caption=broadcast_text)
-            else:
-                await bot.send_message(user_id, broadcast_text)
-            delivered += 1
-        except Exception as e:  # noqa: BLE001
-            print(f"[WARN] Failed to broadcast to {user_id}: {e}")
-            failed += 1
-
-    await message.answer(
-        f"Broadcast complete. Delivered: {delivered}. Failed: {failed}.",
-    )
 
 
 @dp.message(F.text == "/wipe_me")
@@ -1381,17 +2332,141 @@ async def wipe_me_handler(message: types.Message):
     )
 
 
-@dp.message()
+async def process_send_link_action(
+    user_id: int, url: str, sender_username: str | None, reply_target: types.Message
+):
+    recent_sent_at = await get_recent_sent_link_timestamp(user_id, url)
+    if recent_sent_at:
+        retry_after = recent_sent_at + timedelta(days=7)
+        now = datetime.now(timezone.utc)
+        if now < retry_after:
+            remaining_seconds = (retry_after - now).total_seconds()
+            remaining_days = max(1, math.ceil(remaining_seconds / 86400))
+            await reply_target.answer(
+                "You already shared this link recently.\n"
+                f"Please wait {remaining_days} day(s) before sending it again to avoid spam.",
+            )
+            return
+
+    paused = await is_paused(user_id)
+    if paused:
+        await reply_target.answer(
+            "You are currently on pause.\n"
+            "Tap ▶️ Resume if you want to send and receive links again.",
+        )
+        return
+
+    daily_sent = await get_daily_sent_links_count(user_id)
+    if daily_sent >= MAX_DAILY_LINKS:
+        await reply_target.answer(
+            "You have reached the daily limit of 5 links.\n"
+            "0/5 links are left for today.",
+        )
+        return
+
+    friends_ids = await get_all_friend_ids(user_id)
+    sender_username = sender_username or "your friend"
+    sent_count = 0
+    stored_count = 0
+
+    for fid in friends_ids:
+        try:
+            if await is_paused(fid):
+                await save_pending_link(fid, user_id, url)
+                stored_count += 1
+            else:
+                await bot.send_message(
+                    fid,
+                    f"@{sender_username} shared a link with you:\n{url}",
+                )
+                sent_count += 1
+        except Exception as e:
+            print(f"[WARN] Failed to deliver link to {fid}: {e}")
+
+    new_daily_total = await increment_sent_links(user_id)
+    await record_sent_link(user_id, url)
+
+    remaining_links = max(0, MAX_DAILY_LINKS - new_daily_total)
+    remaining_text = (
+        f"You have {remaining_links}/{MAX_DAILY_LINKS} link(s) left for today."
+        if remaining_links > 0
+        else "You have 0/5 links left for today."
+    )
+
+    if sent_count == 0 and stored_count == 0:
+        await reply_target.answer(
+            "Got your link ✅\n"
+            "Right now you don't have any friends to send it to.\n"
+            f"{remaining_text}"
+        )
+        return
+
+    parts = ["Got your link ✅"]
+    if sent_count:
+        parts.append(f"Sent to {sent_count} active friend(s).")
+    if stored_count:
+        parts.append(f"Saved for {stored_count} friend(s) who are on pause.")
+    parts.append(remaining_text)
+    await reply_target.answer("\n".join(parts))
+
+
+@dp.callback_query(F.data == "link_action:wishlist")
+async def link_action_wishlist(callback: types.CallbackQuery):
+    urls = pending_link_actions.pop(callback.from_user.id, None)
+    forwarded_link_collections.pop(callback.from_user.id, None)
+    if not urls:
+        await callback.answer("Please send a link first.", show_alert=True)
+        return
+
+    set_submenu(callback.from_user.id, "wishlist")
+    await add_links_to_wishlist(callback.from_user.id, urls, callback.message)
+    await send_editable_wishlist(
+        callback.message, callback.from_user.id, show_summary=False
+    )
+    await _delete_link_prompt_message(callback.message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "link_action:send")
+async def link_action_send(callback: types.CallbackQuery):
+    urls = pending_link_actions.pop(callback.from_user.id, None)
+    forwarded_link_collections.pop(callback.from_user.id, None)
+    if not urls:
+        await callback.answer("Please send a link first.", show_alert=True)
+        return
+
+    if len(urls) > 1:
+        await callback.answer("Send links one at a time to share with friends.", show_alert=True)
+        return
+
+    await process_send_link_action(
+        user_id=callback.from_user.id,
+        url=urls[0],
+        sender_username=callback.from_user.username,
+        reply_target=callback.message,
+    )
+    await _delete_link_prompt_message(callback.message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "link_action:cancel")
+async def link_action_cancel(callback: types.CallbackQuery):
+    pending_link_actions.pop(callback.from_user.id, None)
+    forwarded_link_collections.pop(callback.from_user.id, None)
+    await _delete_link_prompt_message(callback.message)
+    await callback.answer("Cancelled.")
+
+
 async def generic_handler(message: types.Message):
     """
     Generic handler:
     - add friend by @username (with invite fallback)
-    - remove friend via -@username
     - send links to friends or store for paused friends
     - fallback text
     """
     user_id = message.from_user.id
     text = message.text or ""
+    is_forwarded = _is_forwarded_message(message)
     user_paused = await is_paused(user_id)
 
     async with LoadingIndicator(message):
@@ -1401,7 +2476,7 @@ async def generic_handler(message: types.Message):
                 await message.answer(
                     "I couldn't deliver your feedback because it included media. "
                     "Please send your feedback as plain text without any photos, videos, or other attachments so I can pass it along.",
-                    reply_markup=feedback_keyboard(),
+                    reply_markup=help_keyboard() if not user_paused else pause_overlay_keyboard(),
                 )
                 return
 
@@ -1411,13 +2486,13 @@ async def generic_handler(message: types.Message):
             if not delivered:
                 await message.answer(
                     "I couldn't deliver your feedback because the admin destination isn't configured yet.",
-                    reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+                    reply_markup=help_keyboard() if not user_paused else pause_overlay_keyboard(),
                 )
                 return
 
             await message.answer(
                 "Thanks! I delivered your feedback to the admin.",
-                reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+                reply_markup=help_keyboard() if not user_paused else pause_overlay_keyboard(),
             )
             return
 
@@ -1437,9 +2512,24 @@ async def generic_handler(message: types.Message):
             else:
                 await message.answer(
                     "I kept your account. You can continue using Kind Friends.",
-                    reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+                    reply_markup=help_keyboard() if not user_paused else pause_overlay_keyboard(),
                 )
                 return
+
+        # 0.2) Wishlist add mode
+        if user_id in wishlist_add_mode:
+            urls = extract_urls_from_text(text)
+            if not urls:
+                await message.answer(
+                    "I couldn't find any links in that message. Please send at least one link to save it to your wishlist.",
+                    reply_markup=wishlist_keyboard(),
+                )
+                return
+
+            wishlist_add_mode.discard(user_id)
+            await add_links_to_wishlist(user_id, urls, message)
+            await send_editable_wishlist(message, user_id, show_summary=False)
+            return
 
         # 1) Add friend mode
         if user_id in add_friend_mode and text.startswith("@"):
@@ -1447,7 +2537,7 @@ async def generic_handler(message: types.Message):
             friend_username_raw = text.strip()
 
             friend_count = await get_friend_count(user_id)
-            max_friends = get_max_friends(user_id)
+            max_friends = get_max_friends(settings, user_id)
             if friend_count >= max_friends:
                 await message.answer(
                     f"You already have {max_friends} friends. Unfortunately there is a limit because it’s MVP, "
@@ -1465,7 +2555,7 @@ async def generic_handler(message: types.Message):
                 invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
                 await message.answer(
                     "I can't find this user in **Kind Friends** yet.\n\n"
-                    "I'll send you an invite message next that you can forward to them.",
+                    "Forward my previous message with invitation link to your friends.",
                 )
                 await message.answer(
                     "👋 I use Kind Friends to share my links with friends so they can support me "
@@ -1493,7 +2583,7 @@ async def generic_handler(message: types.Message):
                 return
 
             friend_friend_count = await get_friend_count(friend_tg_id)
-            friend_limit_for_friend = get_max_friends(friend_tg_id)
+            friend_limit_for_friend = get_max_friends(settings, friend_tg_id)
             if friend_friend_count >= friend_limit_for_friend:
                 await message.answer(
                     "Unfortunately it’s not possible to add this friend because their friend pool is full.",
@@ -1511,7 +2601,7 @@ async def generic_handler(message: types.Message):
 
             incoming_request = await get_pending_friend_request(friend_tg_id, user_id)
             if incoming_request:
-                friend_max_friends = get_max_friends(user_id)
+                friend_max_friends = get_max_friends(settings, user_id)
                 if friend_count >= friend_max_friends:
                     await delete_friend_request(incoming_request["id"])
                     await message.answer(
@@ -1612,127 +2702,68 @@ async def generic_handler(message: types.Message):
 
         # 1.5) Remove friend mode
         if user_id in remove_friend_mode:
-            remove_friend_mode.discard(user_id)
-            friend_username_raw = normalize_username_input(text)
-            if not friend_username_raw:
-                await message.answer(
-                    "Please send a valid @username to remove a friend.",
-                    reply_markup=friends_keyboard(),
-                )
-                return
-
-            friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-            if not friend_tg_id:
-                await message.answer(
-                    "I can't find this friend in Kind Friends.",
-                    reply_markup=friends_keyboard(),
-                )
-                return
-
-            await remove_friendship(user_id, friend_tg_id)
-            await notify_friend_removed(user_id, friend_tg_id)
             await message.answer(
-                f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
-                reply_markup=friends_keyboard(),
-            )
-            return
-
-        # 2) Remove friend: -@username
-        if text.startswith("-@"):
-            friend_username_raw = normalize_username_input(text[2:])
-            if not friend_username_raw:
-                await message.answer("Please send a valid @username to remove a friend.")
-                return
-            friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-            if not friend_tg_id:
-                await message.answer("I can't find this friend in Kind Friends.")
-                return
-
-            await remove_friendship(user_id, friend_tg_id)
-            await notify_friend_removed(user_id, friend_tg_id)
-            await message.answer(
-                f"You are no longer connected with {friend_username_raw} on Kind Friends."
+                "Tap a friend in the Remove menu to delete them, or tap ↩️ Back to exit.",
+                reply_markup=back_only_keyboard(),
             )
             return
 
         # 3) Link sending
-        if text.startswith("http://") or text.startswith("https://"):
-            recent_sent_at = await get_recent_sent_link_timestamp(user_id, text)
-            if recent_sent_at:
-                retry_after = recent_sent_at + timedelta(days=7)
-                now = datetime.now(timezone.utc)
-                if now < retry_after:
-                    remaining_seconds = (retry_after - now).total_seconds()
-                    remaining_days = max(1, math.ceil(remaining_seconds / 86400))
-                    await message.answer(
-                        "You already shared this link recently.\n"
-                        f"Please wait {remaining_days} day(s) before sending it again to avoid spam.",
-                    )
-                    return
+        urls = extract_urls_from_text(text)
+        if urls:
+            if is_forwarded:
+                combined_urls = forwarded_link_collections.get(user_id, []) + urls
+                combined_urls = _deduplicate_urls(combined_urls)
+                forwarded_link_collections[user_id] = combined_urls
+                pending_link_actions[user_id] = combined_urls
 
-            paused = user_paused
-            if paused:
+                summary_lines = [
+                    "I gathered these links from your forwarded messages:",
+                    *(f"• {url}" for url in combined_urls),
+                    "Add all of them to your wishlist?",
+                ]
+
                 await message.answer(
-                    "You are currently on pause.\n"
-                    "Tap ▶️ Resume if you want to send and receive links again."
+                    "\n".join(summary_lines),
+                    reply_markup=link_action_keyboard(multiple=True),
+                    disable_web_page_preview=True,
                 )
                 return
 
-            daily_sent = await get_daily_sent_links_count(user_id)
-            if daily_sent >= MAX_DAILY_LINKS:
+            forwarded_link_collections.pop(user_id, None)
+            pending_link_actions[user_id] = urls
+            if len(urls) > 1:
                 await message.answer(
-                    "You have reached the daily limit of 5 links.\n"
-                    "0/5 links are left for today.",
-                )
-                return
-
-            friends_ids = await get_all_friend_ids(user_id)
-            sender_username = message.from_user.username or "your friend"
-            sent_count = 0
-            stored_count = 0
-
-            for fid in friends_ids:
-                try:
-                    if await is_paused(fid):
-                        await save_pending_link(fid, user_id, text)
-                        stored_count += 1
-                    else:
-                        await bot.send_message(
-                            fid,
-                            f"@{sender_username} shared a link with you:\n{text}",
-                        )
-                        sent_count += 1
-                except Exception as e:
-                    print(f"[WARN] Failed to deliver link to {fid}: {e}")
-
-            # increment personal counter
-            new_daily_total = await increment_sent_links(user_id)
-            await record_sent_link(user_id, text)
-
-            remaining_links = max(0, MAX_DAILY_LINKS - new_daily_total)
-            remaining_text = f"{remaining_links}/{MAX_DAILY_LINKS} links are left for today."
-
-            if sent_count == 0 and stored_count == 0:
-                await message.answer(
-                    "Got your link ✅\n"
-                    "Right now you don't have any friends to send it to.\n"
-                    f"{remaining_text}"
+                    "I found multiple links. I can add them to your wishlist.",
+                    reply_markup=link_action_keyboard(multiple=True),
                 )
             else:
-                parts = ["Got your link ✅"]
-                if sent_count:
-                    parts.append(f"Sent to {sent_count} active friend(s).")
-                if stored_count:
-                    parts.append(f"Saved for {stored_count} friend(s) who are on pause.")
-                parts.append(remaining_text)
-                await message.answer("\n".join(parts))
+                await message.answer(
+                    f"I found this link:\n{urls[0]}\nWhat would you like to do?",
+                    reply_markup=link_action_keyboard(),
+                )
             return
 
+        if not is_forwarded:
+            forwarded_link_collections.pop(user_id, None)
+
         # 4) Fallback
+        set_submenu(user_id, "root")
         await message.answer(
             "Use the buttons to open Friends or Help, or paste a link to share it with friends.",
-            reply_markup=main_keyboard(user_paused),
+            reply_markup=pause_overlay_keyboard() if user_paused else main_keyboard(False),
         )
+
+
+register_admin_handlers(
+    dp=dp,
+    bot=bot,
+    settings=settings,
+    database=database,
+    generic_handler=generic_handler,
+)
+
+dp.message.register(generic_handler)
 
 
 async def on_startup(app):
