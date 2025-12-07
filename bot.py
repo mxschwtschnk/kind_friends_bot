@@ -601,7 +601,16 @@ def _shorten_url(url: str, max_length: int = 32) -> str:
 
 async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
     try:
-        async with session.get(url, timeout=10) as response:
+        async with session.get(
+            url,
+            timeout=10,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+                )
+            },
+        ) as response:
             if response.status >= 400:
                 return {"title": None, "image": None}
             content_type = response.headers.get("content-type", "")
@@ -614,29 +623,29 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
 
     html_slice = raw_html[:200000]
 
+    def _extract_attr(tag: str, attr: str) -> str | None:
+        match = re.search(rf'{attr}\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+
+    meta_tags = re.findall(r"<meta[^>]*>", html_slice, flags=re.IGNORECASE)
+    meta_map: dict[str, str] = {}
+    for tag in meta_tags:
+        name = _extract_attr(tag, "property") or _extract_attr(tag, "name")
+        content = _extract_attr(tag, "content")
+        if name and content and name.lower() not in meta_map:
+            meta_map[name.lower()] = content.strip()
+
     def _search_meta(names: tuple[str, ...]):
         for name in names:
-            patterns = [
-                re.compile(
-                    rf'<meta[^>]+(?:property|name)=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']',
-                    re.IGNORECASE,
-                ),
-                re.compile(
-                    rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{re.escape(name)}["\']',
-                    re.IGNORECASE,
-                ),
-            ]
-            for pattern in patterns:
-                match = pattern.search(html_slice)
-                if match:
-                    return match.group(1).strip()
+            if name.lower() in meta_map:
+                return meta_map[name.lower()]
         return None
 
     def _search_title_tag():
         match = re.search(r"<title[^>]*>(.*?)</title>", html_slice, re.IGNORECASE | re.DOTALL)
         return match.group(1).strip() if match else None
 
-    title = _search_meta(("og:title", "twitter:title", "title")) or _search_title_tag()
+    title = _search_meta(("og:title", "twitter:title", "twitter:text:title", "title")) or _search_title_tag()
     image = _search_meta(("og:image", "twitter:image", "twitter:image:src"))
     if image:
         image = urljoin(url, image)
@@ -831,12 +840,9 @@ async def send_editable_wishlist(message: types.Message, user_id: int):
     enriched_items = await enrich_wishlist_items(items)
     await send_wishlist_gallery(message, enriched_items)
     await message.answer(
+        "Tap an item to open or delete it. Send another link here to add it to your wishlist.\n\n"
         "Wishlist:",
         reply_markup=wishlist_items_keyboard(enriched_items, editable=True),
-    )
-    await message.answer(
-        "Tap an item to open or delete it. Send another link here to add it to your wishlist.",
-        reply_markup=wishlist_keyboard(),
     )
 
 
