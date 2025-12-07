@@ -614,7 +614,7 @@ class Database:
         self,
         owner_id: int,
         url: str,
-        product_name: str | None,
+        product_name: str | None = None,
         shop: str | None = None,
         price: str | None = None,
         image_url: str | None = None,
