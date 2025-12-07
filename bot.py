@@ -636,13 +636,25 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
         # Prefer the most descriptive portion (usually the product) when stores include
         # their brand in the page title. Choose the longest non-empty chunk to avoid
         # returning only the shop name (e.g., "Store | Product" -> "Product").
-        parts = re.split(r"\s+[\-|–|—]\s+|\s*\|\s*", title)
+        parts = re.split(r"\s+[\-|–|—|:]\s+|\s*\|\s*|:\s*", title)
         parts = [p.strip() for p in parts if p and p.strip()]
-        if parts:
-            parts.sort(key=len, reverse=True)
-            return parts[0]
 
-        return title.strip()
+        # Filter out chunks that look like domain names or store names so that we keep
+        # the actual product title when possible (e.g., drop "Amazon.de" and keep the
+        # product description).
+        store_pattern = re.compile(r"\b(amazon|etsy|ebay|walmart|aliexpress|target)\b", re.IGNORECASE)
+        domain_pattern = re.compile(r"\b\w+\.\w+\b")
+        descriptive_parts = [
+            p for p in parts if not store_pattern.search(p) and not domain_pattern.search(p)
+        ]
+
+        if descriptive_parts:
+            parts = descriptive_parts
+
+        if not parts:
+            return title.strip()
+
+        return max(parts, key=len)
 
     def _extract_product_from_ld_json():
         scripts = re.findall(
@@ -665,6 +677,8 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
                     image = data.get("image")
                     if isinstance(image, list) and image:
                         image = image[0]
+                    if isinstance(image, dict):
+                        image = image.get("url") or image.get("@id")
                     return {"title": name, "image": image}
                 for value in data.values():
                     found = _walk(value)
