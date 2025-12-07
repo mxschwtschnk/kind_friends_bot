@@ -101,13 +101,19 @@ Submenu = Literal[
     "friends_invite",
     "friends_remove",
     "help",
+    "help_feedback",
     "wishlist",
+    "wishlist_add",
+    "wishlist_delete",
 ]
 current_submenu: dict[int, list[Submenu]] = {}
 
 SUBMENU_PARENTS: dict[Submenu, Submenu] = {
     "friends_invite": "friends",
     "friends_remove": "friends",
+    "help_feedback": "help",
+    "wishlist_add": "wishlist",
+    "wishlist_delete": "wishlist",
 }
 TOP_LEVEL_MENUS: set[Submenu] = {"friends", "wishlist", "help"}
 
@@ -565,10 +571,16 @@ def display_username(username: str | None, fallback: str = "friend") -> str:
 
 def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
     pause_button = KeyboardButton(text="▶️ Resume") if paused else KeyboardButton(text="⏸ Pause")
-    keyboard = [
-        [pause_button, KeyboardButton(text="👥 Friends"), KeyboardButton(text="🎁 Wishlist")],
-        [KeyboardButton(text="ℹ️ Help")],
-    ]
+    if paused:
+        keyboard = [
+            [pause_button, KeyboardButton(text="🎁 Wishlist")],
+            [KeyboardButton(text="ℹ️ Help")],
+        ]
+    else:
+        keyboard = [
+            [pause_button, KeyboardButton(text="👥 Friends"), KeyboardButton(text="🎁 Wishlist")],
+            [KeyboardButton(text="ℹ️ Help")],
+        ]
 
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -1232,21 +1244,26 @@ async def help_handler(message: types.Message):
 
 
 async def send_editable_wishlist(
-    message: types.Message, user_id: int, preface_text: str | None = None
+    message: types.Message,
+    user_id: int,
+    preface_text: str | None = None,
+    reply_markup: ReplyKeyboardMarkup | None = None,
 ):
     wishlist_add_mode.discard(user_id)
     items = [dict(item) for item in await get_wishlist_items(user_id)]
+    keyboard = reply_markup or wishlist_keyboard()
+
     if not items:
         await message.answer(
             "Your wishlist is empty right now. Send me a link to add your first item.",
-            reply_markup=wishlist_keyboard(),
+            reply_markup=keyboard,
         )
         return
 
     await message.answer(
         preface_text
         or "Manage your wishlist. Use Add to save a link or Delete to remove an item.",
-        reply_markup=wishlist_keyboard(),
+        reply_markup=keyboard,
     )
     await message.answer(
         "Tap an item to open or delete it. Send another link here to add it to your wishlist.\n\n"
@@ -1265,18 +1282,22 @@ async def wishlist_menu(message: types.Message):
 @dp.message(F.text == "➕ Add link")
 async def wishlist_add_prompt(message: types.Message):
     user_id = message.from_user.id
-    set_submenu(user_id, "wishlist")
+    set_submenu(user_id, "wishlist_add")
     wishlist_add_mode.add(user_id)
     await message.answer(
         "Send me a link to add to your wishlist.",
-        reply_markup=wishlist_keyboard(),
+        reply_markup=back_only_keyboard(),
     )
 
 
 @dp.message(F.text == "🗑 Delete item")
 async def wishlist_delete_prompt(message: types.Message):
+    set_submenu(message.from_user.id, "wishlist_delete")
     await send_editable_wishlist(
-        message, message.from_user.id, preface_text="Tap an item below to delete it."
+        message,
+        message.from_user.id,
+        preface_text="Tap an item below to delete it.",
+        reply_markup=back_only_keyboard(),
     )
 
 
@@ -1342,10 +1363,11 @@ async def delete_account_prompt(message: types.Message):
 
 @dp.message(F.text == "💬 Feedback")
 async def start_feedback_from_menu(message: types.Message):
+    set_submenu(message.from_user.id, "help_feedback")
     feedback_mode.add(message.from_user.id)
     await message.answer(
         "Thanks for willing to share feedback!\nSend your thoughts in one message and I'll pass it along.",
-        reply_markup=help_keyboard(),
+        reply_markup=back_only_keyboard(),
     )
 
 
