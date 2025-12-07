@@ -657,7 +657,20 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
         if not parts:
             return title.strip()
 
-        return max(parts, key=len)
+        best = max(parts, key=len).strip()
+
+        # If the best part still looks like just a store or domain (e.g., "Amazon.de"),
+        # skip it so that later fallbacks (headings or URL slug) can provide a more
+        # product-like label.
+        if store_pattern.search(best) or domain_pattern.search(best):
+            return None
+
+        # Skip very short leftovers such as "Home" or "Shop" that are unlikely to be
+        # the product name.
+        if len(best) < 4:
+            return None
+
+        return best
 
     def _extract_product_from_ld_json():
         scripts = re.findall(
@@ -701,8 +714,8 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
             if isinstance(data, list):
                 for item in data:
                     found = _walk(item)
-                    if found and not best:
-                        best = found
+                    if found:
+                        _maybe_update(found)
             elif isinstance(data, dict):
                 type_field = data.get("@type")
                 types = [type_field] if isinstance(type_field, str) else type_field or []
@@ -721,8 +734,8 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
                         _maybe_update({"title": name, "image": image})
                 for value in data.values():
                     found = _walk(value)
-                    if found and not best:
-                        best = found
+                    if found:
+                        _maybe_update(found)
             return best
 
         for script in scripts:
