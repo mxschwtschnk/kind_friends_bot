@@ -593,7 +593,7 @@ def pause_overlay_keyboard() -> ReplyKeyboardMarkup:
 def friends_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Invite"), KeyboardButton(text="➖ Remove")],
+            [KeyboardButton(text="Invite"), KeyboardButton(text="Remove")],
             [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
@@ -604,9 +604,9 @@ def help_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="📖 How to"),
-                KeyboardButton(text="💬 Feedback"),
-                KeyboardButton(text="🧹 Wipe Account"),
+                KeyboardButton(text="How to"),
+                KeyboardButton(text="Feedback"),
+                KeyboardButton(text="Wipe Account"),
             ],
             [KeyboardButton(text="⬅️ Back")],
         ],
@@ -692,7 +692,7 @@ def friend_list_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
 def friend_options_keyboard(username: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Remove", callback_data=f"friend_remove:{username}")],
+            [InlineKeyboardButton(text="Remove", callback_data=f"friend_remove:{username}")],
             [InlineKeyboardButton(text="🎁 Wishlist", callback_data=f"friend_wishlist:{username}")],
         ]
     )
@@ -1396,7 +1396,7 @@ async def wishlist_edit(message: types.Message):
     await send_editable_wishlist(message, message.from_user.id)
 
 
-@dp.message(F.text == "📖 How to")
+@dp.message(F.text == "How to")
 async def how_to_handler(message: types.Message):
     await message.answer(
         "This should be a message under How to\n\n"
@@ -1408,26 +1408,26 @@ async def how_to_handler(message: types.Message):
         "• You can share up to 5 links per day.\n"
         "• The same exact link can only be sent again after 7 days (to avoid spam).\n\n"
         "3️⃣ Adding friends\n"
-        "• Tap “👥 Friends →➕ Invite” and send your friend’s @username.\n"
+        "• Tap “👥 Friends → Invite” and send your friend’s @username.\n"
         "• If they already use Kind Friends, they get a request to connect.\n"
         "• If they don’t, you’ll receive an invite message + link that you can forward.\n"
         "• You can have up to 15 friends connected.\n\n"
         "4️⃣ Removing friends\n"
-        "• Use “👥 Friends → ➖ Remove” and tap a friend from the list.\n"
+        "• Use “👥 Friends → Remove” and tap a friend from the list.\n"
         "• Removing a friend stops future link sharing, but past messages stay in their chat.\n\n"
         "5️⃣ Pause / Resume\n"
         "• Tap “⏸ Pause” to stop sending and receiving links.\n"
         "• While paused, your friends’ links are stored for you.\n"
         "• Tap “▶️ Resume” to become active again and get a summary of links you missed.\n\n"
         "6️⃣ Wipe account\n"
-        "• Tap “🧹 Wipe Account” to delete your Kind Friends account, friendships,\n"
+        "• Tap “Wipe Account” to delete your Kind Friends account, friendships,\n"
         "and stored pending links.\n"
         "• Already delivered messages in other chats can’t be removed.",
         reply_markup=help_keyboard(),
     )
 
 
-@dp.message(F.text == "🧹 Wipe Account")
+@dp.message(F.text == "Wipe Account")
 async def delete_account_prompt(message: types.Message):
     user_id = message.from_user.id
     delete_account_confirmation.add(user_id)
@@ -1444,7 +1444,7 @@ async def delete_account_prompt(message: types.Message):
     )
 
 
-@dp.message(F.text == "💬 Feedback")
+@dp.message(F.text == "Feedback")
 async def start_feedback_from_menu(message: types.Message):
     set_submenu(message.from_user.id, "help_feedback")
     feedback_mode.add(message.from_user.id)
@@ -1573,7 +1573,7 @@ async def resume_handler(message: types.Message):
     await message.answer(digest_text)
 
 
-@dp.message(F.text == "➕ Invite")
+@dp.message(F.text == "Invite")
 async def invite_friends_handler(message: types.Message):
     user_id = message.from_user.id
     set_submenu(user_id, "friends_invite")
@@ -1626,7 +1626,7 @@ async def friends_handler(message: types.Message):
         )
 
 
-@dp.message(F.text == "➖ Remove")
+@dp.message(F.text == "Remove")
 async def remove_friend_handler(message: types.Message):
     user_id = message.from_user.id
     set_submenu(user_id, "friends_remove")
@@ -1650,7 +1650,7 @@ async def remove_friend_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
     if user_id not in remove_friend_mode:
-        await callback.answer("Remove mode is closed. Tap ➖ Remove to start again.", show_alert=True)
+        await callback.answer("Remove mode is closed. Tap Remove to start again.", show_alert=True)
         return
 
     try:
@@ -1687,7 +1687,7 @@ async def remove_friend_confirm_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
     if user_id not in remove_friend_mode:
-        await callback.answer("Remove mode is closed. Tap ➖ Remove to start again.", show_alert=True)
+        await callback.answer("Remove mode is closed. Tap Remove to start again.", show_alert=True)
         return
 
     try:
@@ -1728,7 +1728,7 @@ async def remove_friend_cancel_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
     if user_id not in remove_friend_mode:
-        await callback.answer("Remove mode is closed. Tap ➖ Remove to start again.", show_alert=True)
+        await callback.answer("Remove mode is closed. Tap Remove to start again.", show_alert=True)
         return
 
     remove_friend_confirmations.pop(user_id, None)
