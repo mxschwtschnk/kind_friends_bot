@@ -1366,10 +1366,15 @@ async def cmd_start(message: types.Message):
     )
 
     await message.answer(
-        "Hey 👋 I help friends share their links and content to support each other with likes, shares, and comments.\n\n"
-        "• Create your circle of friends (up to 15)\n"
-        "• Paste a link here and I will share it with your circle.\n"
-        "• Use the buttons to open Friends, Pause/Resume, or get more information in Help.\n\n"
+        "Hey 👋 \n"
+        "I help to connect friends to support each other.\n\n"
+        "What you can do here:\n"
+        "• Create your circle of friends (up to 15).\n"
+        "• Share any link (your post, podcast, article, video or stream) and your friends instantly get it.\n"
+        "• Add any product's link to your personal Wishlist.\n"
+        "• Look up for your friends' Wishes.\n"
+        "• Anti-spam limits (5 links/day + 7-day cooldown per link).\n\n"
+        "Just send me a link — I handle the rest.\n\n"
         "*This is an MVP version. Your feedback is very welcome!*\n"
         + invite_note,
         reply_markup=pause_overlay_keyboard() if paused else main_keyboard(False),
