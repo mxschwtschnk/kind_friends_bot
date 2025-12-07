@@ -582,16 +582,33 @@ def back_only_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def remove_friends_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text=f"@{username}",
-                callback_data=f"remove_friend:{username}",
+def remove_friends_keyboard(
+    friends: list[str], confirming: str | None = None
+) -> InlineKeyboardMarkup:
+    buttons = []
+    for username in friends:
+        if confirming == username:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Yes",
+                        callback_data=f"remove_friend_confirm:{username}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Cancel",
+                        callback_data="remove_friend_cancel",
+                    ),
+                ]
             )
-        ]
-        for username in friends
-    ]
+        else:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"@{username}",
+                        callback_data=f"remove_friend:{username}",
+                    )
+                ]
+            )
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1300,23 +1317,15 @@ async def remove_friend_handler(message: types.Message):
     friends = await get_friend_usernames(user_id)
 
     if not friends:
-        await message.answer(
-            "You don't have any friends connected yet.\n"
-            "Tap “➕ Invite” to add someone.",
-        )
+        await message.answer("You don't have any friends connected yet.")
         return
 
     remove_friend_mode.add(user_id)
     add_friend_mode.discard(user_id)
     remove_friend_confirmations.pop(user_id, None)
+    await message.answer("Removing friends.", reply_markup=back_only_keyboard())
     await message.answer(
-        "You can now delete your friends from the list.\n"
-        "Choose one or a few by clicking on the tags below.",
-        reply_markup=back_only_keyboard(),
-    )
-    await message.answer(
-        "Tap a friend to remove them:",
-        reply_markup=remove_friends_keyboard(friends),
+        "Select a friend to remove.", reply_markup=remove_friends_keyboard(friends)
     )
 
 
@@ -1339,36 +1348,84 @@ async def remove_friend_callback(callback: types.CallbackQuery):
         await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
         return
 
+    friends = await get_friend_usernames(user_id)
+    if friend_username_raw not in friends:
+        await callback.answer("This friend is no longer available.", show_alert=True)
+        return
+
+    remove_friend_confirmations[user_id] = friend_username_raw
+    await callback.answer(f"Remove @{friend_username_raw}?", show_alert=True)
+
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=remove_friends_keyboard(
+                friends, confirming=friend_username_raw
+            )
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to show removal confirmation for {user_id}: {e}")
+
+
+@dp.callback_query(F.data.startswith("remove_friend_confirm:"))
+async def remove_friend_confirm_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
+    if user_id not in remove_friend_mode:
+        await callback.answer("Remove mode is closed. Tap ➖ Remove to start again.", show_alert=True)
+        return
+
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid remove action.", show_alert=True)
+        return
+
     pending_confirmation = remove_friend_confirmations.get(user_id)
     if pending_confirmation != friend_username_raw:
-        remove_friend_confirmations[user_id] = friend_username_raw
-        await callback.answer(
-            f"Remove @{friend_username_raw}? Tap again to confirm.", show_alert=True
-        )
+        await callback.answer("Please select a friend to remove first.", show_alert=True)
+        return
+
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
         return
 
     remove_friend_confirmations.pop(user_id, None)
     await remove_friendship(user_id, friend_tg_id)
     await notify_friend_removed(user_id, friend_tg_id)
 
-    await callback.answer("Friend removed.", show_alert=True)
-
     updated_friends = await get_friend_usernames(user_id)
-    if updated_friends:
-        try:
-            await callback.message.edit_reply_markup(
-                reply_markup=remove_friends_keyboard(updated_friends)
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"[WARN] Failed to refresh removal keyboard for {user_id}: {e}")
-    else:
-        try:
-            await callback.message.edit_text(
-                "You removed all friends. Tap ⬅️ Back to exit remove mode.",
-                reply_markup=None,
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"[WARN] Failed to update empty removal message for {user_id}: {e}")
+    await callback.answer("Removed.")
+
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=remove_friends_keyboard(updated_friends)
+            if updated_friends
+            else None
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to refresh removal keyboard for {user_id}: {e}")
+
+
+@dp.callback_query(F.data == "remove_friend_cancel")
+async def remove_friend_cancel_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
+    if user_id not in remove_friend_mode:
+        await callback.answer("Remove mode is closed. Tap ➖ Remove to start again.", show_alert=True)
+        return
+
+    remove_friend_confirmations.pop(user_id, None)
+    friends = await get_friend_usernames(user_id)
+
+    await callback.answer("Cancelled.")
+
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=remove_friends_keyboard(friends) if friends else None
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to refresh removal keyboard for {user_id}: {e}")
 
 
 @dp.callback_query(F.data.startswith("wishlist_item:"))
