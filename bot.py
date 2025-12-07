@@ -566,7 +566,7 @@ def display_username(username: str | None, fallback: str = "friend") -> str:
 def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
     pause_button = KeyboardButton(text="▶️ Resume") if paused else KeyboardButton(text="⏸ Pause")
     keyboard = [
-        [pause_button, KeyboardButton(text="👥 Friends"), KeyboardButton(text="📜 Wishlist")],
+        [pause_button, KeyboardButton(text="👥 Friends"), KeyboardButton(text="🎁 Wishlist")],
         [KeyboardButton(text="ℹ️ Help")],
     ]
 
@@ -574,13 +574,7 @@ def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
 
 
 def pause_overlay_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="▶️ Resume")],
-            [KeyboardButton(text="ℹ️ Help")],
-        ],
-        resize_keyboard=True,
-    )
+    return main_keyboard(True)
 
 
 def friends_keyboard() -> ReplyKeyboardMarkup:
@@ -596,8 +590,11 @@ def friends_keyboard() -> ReplyKeyboardMarkup:
 def help_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📖 How to"), KeyboardButton(text="💬 Feedback")],
-            [KeyboardButton(text="🧹 Wipe Account")],
+            [
+                KeyboardButton(text="📖 How to"),
+                KeyboardButton(text="💬 Feedback"),
+                KeyboardButton(text="🧹 Wipe Account"),
+            ],
             [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
@@ -680,7 +677,7 @@ def friend_options_keyboard(username: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🗑 Remove", callback_data=f"friend_remove:{username}")],
-            [InlineKeyboardButton(text="📜 Wishlist", callback_data=f"friend_wishlist:{username}")],
+            [InlineKeyboardButton(text="🎁 Wishlist", callback_data=f"friend_wishlist:{username}")],
         ]
     )
 
@@ -1258,7 +1255,7 @@ async def send_editable_wishlist(
     )
 
 
-@dp.message(F.text == "📜 Wishlist")
+@dp.message(F.text == "🎁 Wishlist")
 async def wishlist_menu(message: types.Message):
     wishlist_add_mode.discard(message.from_user.id)
     set_submenu(message.from_user.id, "wishlist")
@@ -1348,7 +1345,7 @@ async def start_feedback_from_menu(message: types.Message):
     feedback_mode.add(message.from_user.id)
     await message.answer(
         "Thanks for willing to share feedback!\nSend your thoughts in one message and I'll pass it along.",
-        reply_markup=feedback_keyboard(),
+        reply_markup=help_keyboard(),
     )
 
 
@@ -1508,18 +1505,20 @@ async def friends_handler(message: types.Message):
     friend_count = await get_friend_count(user_id)
     friends = await get_friend_usernames(user_id)
     max_friends = get_max_friends(settings, user_id)
-    text = (
-        f"You have {friend_count}/{max_friends} friends.\n\n"
-        "Tap a friend to open their actions:"
-    )
+    text = f"You have {friend_count}/{max_friends} friends."
     add_friend_mode.discard(user_id)
     remove_friend_mode.discard(user_id)
     remove_friend_confirmations.pop(user_id, None)
     await message.answer(
         text,
         parse_mode="Markdown",
-        reply_markup=friend_list_keyboard(friends) if friends else None,
+        reply_markup=friends_keyboard(),
     )
+    if friends:
+        await message.answer(
+            "Tap a friend to open their actions:",
+            reply_markup=friend_list_keyboard(friends),
+        )
 
 
 @dp.message(F.text == "➖ Remove")
@@ -1885,7 +1884,7 @@ async def start_feedback(callback: types.CallbackQuery):
     await callback.message.answer(
         "Thanks for willing to share feedback!\n"
         "Send your thoughts in one message and I'll pass it along.",
-        reply_markup=feedback_keyboard(),
+        reply_markup=help_keyboard(),
     )
     await callback.answer()
 
@@ -2042,7 +2041,7 @@ async def generic_handler(message: types.Message):
                 await message.answer(
                     "I couldn't deliver your feedback because it included media. "
                     "Please send your feedback as plain text without any photos, videos, or other attachments so I can pass it along.",
-                    reply_markup=feedback_keyboard(),
+                    reply_markup=help_keyboard() if not user_paused else pause_overlay_keyboard(),
                 )
                 return
 
