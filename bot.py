@@ -1189,8 +1189,10 @@ async def friends_handler(message: types.Message):
     header = f"You have {friend_count}/{max_friends} friends.\n\n"
 
     if friends:
-        lines = [f"- @{u}" for u in friends]
-        text = header + "Your friends:\n" + "\n".join(lines)
+        text = (
+            header
+            + "Tap a friend below to open their actions or choose an option to invite or remove."
+        )
     else:
         text = header + "You don't have any friends connected yet."
 
