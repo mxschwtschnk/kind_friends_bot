@@ -90,11 +90,12 @@ delete_wishlist_item = database.delete_wishlist_item
 add_friend_mode = set()  # user_ids who are adding a friend
 remove_friend_mode = set()  # user_ids who are removing a friend
 remove_friend_confirmations: dict[int, str] = {}  # user -> username awaiting confirm
+friend_card_remove_confirmations: dict[int, str] = {}
 feedback_mode = set()  # user_ids who are sending feedback
 delete_account_confirmation = set()  # user_ids awaiting delete confirmation
 wishlist_add_mode = set()  # user_ids adding wishlist entries
 wishlist_delete_confirmations: dict[int, int] = {}  # user -> wishlist item awaiting confirm
-pending_link_actions: dict[int, str] = {}  # last link sent by user waiting for action
+pending_link_actions: dict[int, list[str]] = {}  # links sent by user waiting for action
 Submenu = Literal[
     "root",
     "friends",
@@ -633,11 +634,11 @@ def remove_friends_keyboard(
             buttons.append(
                 [
                     InlineKeyboardButton(
-                        text="Yes",
+                        text="Yes, remove",
                         callback_data=f"remove_friend_confirm:{username}",
                     ),
                     InlineKeyboardButton(
-                        text="Cancel",
+                        text="No, save",
                         callback_data="remove_friend_cancel",
                     ),
                 ]
@@ -664,17 +665,16 @@ def wishlist_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def link_action_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Add to 🎁", callback_data="link_action:wishlist"
-                ),
-                InlineKeyboardButton(text="Send to 👥", callback_data="link_action:send"),
-            ]
-        ]
-    )
+def link_action_keyboard(multiple: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="Add to 🎁", callback_data="link_action:wishlist")]
+    ]
+    if not multiple:
+        buttons[0].append(
+            InlineKeyboardButton(text="Send to 👥", callback_data="link_action:send")
+        )
+    buttons.append([InlineKeyboardButton(text="Cancel", callback_data="link_action:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def friend_list_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
@@ -690,6 +690,20 @@ def friend_options_keyboard(username: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="🗑 Remove", callback_data=f"friend_remove:{username}")],
             [InlineKeyboardButton(text="🎁 Wishlist", callback_data=f"friend_wishlist:{username}")],
+        ]
+    )
+
+
+def friend_remove_confirmation_keyboard(username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Yes, remove",
+                    callback_data=f"friend_card_remove_confirm:{username}",
+                )
+            ],
+            [InlineKeyboardButton(text="No, save", callback_data="friend_card_remove_cancel")],
         ]
     )
 
@@ -1071,11 +1085,25 @@ def wishlist_delete_confirmation_keyboard(item_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Yes, delete", callback_data=f"wishlist_delete_confirm:{item_id}"
+                    text="Yes, delete", callback_data=f"wishlist_delete_confirm:{item_id}"
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ Cancel", callback_data="wishlist_delete_cancel")],
+            [InlineKeyboardButton(text="No, save", callback_data="wishlist_delete_cancel")],
         ]
+    )
+
+
+def wishlist_show_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Show my List", callback_data="wishlist_show")]
+        ]
+    )
+
+
+def wishlist_item_delete_button(item_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Delete", callback_data=f"wishlist_delete:{item_id}")]]
     )
 
 
@@ -1116,20 +1144,21 @@ async def _confirm_or_delete_wishlist_item(
         await callback.answer("This wishlist item is no longer available.", show_alert=True)
         return
 
-    pending_confirmation = wishlist_delete_confirmations.get(callback.from_user.id)
+    delete_mode = get_submenu(callback.from_user.id) == "wishlist_delete"
 
-    if pending_confirmation == item_id:
+    if delete_mode or callback.data.startswith("wishlist_delete_confirm:"):
         await delete_wishlist_item(callback.from_user.id, item_id)
         wishlist_delete_confirmations.pop(callback.from_user.id, None)
-        await callback.answer("Wishlist item deleted.", show_alert=True)
         await _remove_wishlist_item_button(callback.message, item_id)
+        await callback.answer("Wishlist item deleted.")
         return
 
     wishlist_delete_confirmations[callback.from_user.id] = item_id
-    await callback.answer(
-        "Tap again to delete this wishlist item.",
-        show_alert=True,
+    await callback.message.answer(
+        f"Are you sure you want to delete this wishlist item?\n{item['url']}",
+        reply_markup=wishlist_delete_confirmation_keyboard(item_id),
     )
+    await callback.answer()
 # -------------------------------------------------------------------
 # FEEDBACK
 # -------------------------------------------------------------------
@@ -1251,25 +1280,60 @@ async def send_editable_wishlist(
 ):
     wishlist_add_mode.discard(user_id)
     items = [dict(item) for item in await get_wishlist_items(user_id)]
-    keyboard = reply_markup or wishlist_keyboard()
-
-    if not items:
+    count = len(items)
+    summary = preface_text or f"You have {count} wish(es) saved."
+    await message.answer(summary, reply_markup=wishlist_show_keyboard())
+    if count == 0:
         await message.answer(
-            "Your wishlist is empty right now. Send me a link to add your first item.",
-            reply_markup=keyboard,
+            "Send me a link to add your first item.",
+            reply_markup=reply_markup or wishlist_keyboard(),
         )
         return
 
     await message.answer(
-        preface_text
-        or "Manage your wishlist. Use Add to save a link or Delete to remove an item.",
-        reply_markup=keyboard,
+        "Use Add link to save more wishes or Delete item to remove one.",
+        reply_markup=reply_markup or wishlist_keyboard(),
     )
-    await message.answer(
-        "Tap an item to open or delete it. Send another link here to add it to your wishlist.\n\n"
-        "Wishlist:",
-        reply_markup=wishlist_items_keyboard(items, editable=True),
-    )
+
+
+async def send_wishlist_items(
+    message: types.Message, user_id: int, delete_mode: bool = False
+) -> None:
+    items = [dict(item) for item in await get_wishlist_items(user_id)]
+    if not items:
+        await message.answer(
+            "Your wishlist is empty right now. Send me a link to add your first item.",
+            reply_markup=wishlist_keyboard(),
+        )
+        return
+
+    if delete_mode:
+        await message.answer(
+            "Delete mode: tap Delete below any item to remove it immediately.",
+            reply_markup=back_only_keyboard(),
+        )
+
+    for item in items:
+        await message.answer(
+            item["url"],
+            reply_markup=wishlist_item_delete_button(item["id"]),
+        )
+
+
+async def add_links_to_wishlist(
+    user_id: int, urls: list[str], message: types.Message
+) -> None:
+    saved: list[tuple[int, str]] = []
+    for url in urls:
+        item_id = await add_wishlist_item(user_id, url)
+        saved.append((item_id, url))
+
+    for idx, (item_id, url) in enumerate(saved):
+        prefix = "Saved to your wishlist ✅\n" if idx == 0 else ""
+        await message.answer(
+            f"{prefix}{url}",
+            reply_markup=wishlist_item_delete_button(item_id),
+        )
 
 
 @dp.message(F.text == "🎁 Wishlist")
@@ -1293,12 +1357,7 @@ async def wishlist_add_prompt(message: types.Message):
 @dp.message(F.text == "🗑 Delete item")
 async def wishlist_delete_prompt(message: types.Message):
     set_submenu(message.from_user.id, "wishlist_delete")
-    await send_editable_wishlist(
-        message,
-        message.from_user.id,
-        preface_text="Tap an item below to delete it.",
-        reply_markup=back_only_keyboard(),
-    )
+    await send_wishlist_items(message, message.from_user.id, delete_mode=True)
 
 
 @dp.message(F.text == "✏️ Edit")
@@ -1704,6 +1763,13 @@ async def wishlist_delete_cancel_callback(callback: types.CallbackQuery):
         print(f"[WARN] Failed to clear wishlist deletion prompt: {e}")
 
 
+@dp.callback_query(F.data == "wishlist_show")
+async def wishlist_show_callback(callback: types.CallbackQuery):
+    set_submenu(callback.from_user.id, "wishlist")
+    await send_wishlist_items(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("friend_card:"))
 async def friend_card_callback(callback: types.CallbackQuery):
     try:
@@ -1748,6 +1814,39 @@ async def friend_remove_from_card(callback: types.CallbackQuery):
         await callback.answer("You are no longer connected with this friend.", show_alert=True)
         return
 
+    friend_card_remove_confirmations[user_id] = friend_username_raw
+    await callback.message.answer(
+        f"Are you sure you want to remove @{friend_username_raw}?",
+        reply_markup=friend_remove_confirmation_keyboard(friend_username_raw),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("friend_card_remove_confirm:"))
+async def friend_remove_from_card_confirm(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    try:
+        friend_username_raw = callback.data.split(":", maxsplit=1)[1]
+    except (IndexError, ValueError):
+        await callback.answer("Invalid friend action.", show_alert=True)
+        return
+
+    pending_username = friend_card_remove_confirmations.get(user_id)
+    if pending_username != friend_username_raw:
+        await callback.answer("Please start the removal again from the friends list.", show_alert=True)
+        return
+
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
+        return
+
+    friends_ids = await get_all_friend_ids(user_id)
+    if friend_tg_id not in friends_ids:
+        await callback.answer("You are no longer connected with this friend.", show_alert=True)
+        return
+
+    friend_card_remove_confirmations.pop(user_id, None)
     await remove_friendship(user_id, friend_tg_id)
     await notify_friend_removed(user_id, friend_tg_id)
 
@@ -1757,6 +1856,12 @@ async def friend_remove_from_card(callback: types.CallbackQuery):
         f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
         reply_markup=friends_keyboard(),
     )
+
+
+@dp.callback_query(F.data == "friend_card_remove_cancel")
+async def friend_remove_from_card_cancel(callback: types.CallbackQuery):
+    friend_card_remove_confirmations.pop(callback.from_user.id, None)
+    await callback.answer("Kept your friend.")
 
 
 @dp.callback_query(F.data.startswith("friend_wishlist:"))
@@ -2005,44 +2110,41 @@ async def process_send_link_action(
 
 @dp.callback_query(F.data == "link_action:wishlist")
 async def link_action_wishlist(callback: types.CallbackQuery):
-    url = pending_link_actions.pop(callback.from_user.id, None)
-    if not url:
+    urls = pending_link_actions.pop(callback.from_user.id, None)
+    if not urls:
         await callback.answer("Please send a link first.", show_alert=True)
         return
 
-    async with aiohttp.ClientSession() as session:
-        metadata = await _fetch_link_metadata(session, url)
     set_submenu(callback.from_user.id, "wishlist")
-    await add_wishlist_item(
-        callback.from_user.id,
-        url,
-        metadata.get("product_name"),
-        metadata.get("shop"),
-        metadata.get("price"),
-        metadata.get("image_url"),
-    )
-    await callback.message.answer(
-        "Saved to your wishlist ✅",
-        reply_markup=wishlist_keyboard(),
-    )
+    await add_links_to_wishlist(callback.from_user.id, urls, callback.message)
     await send_editable_wishlist(callback.message, callback.from_user.id)
     await callback.answer()
 
 
 @dp.callback_query(F.data == "link_action:send")
 async def link_action_send(callback: types.CallbackQuery):
-    url = pending_link_actions.pop(callback.from_user.id, None)
-    if not url:
+    urls = pending_link_actions.pop(callback.from_user.id, None)
+    if not urls:
         await callback.answer("Please send a link first.", show_alert=True)
+        return
+
+    if len(urls) > 1:
+        await callback.answer("Send links one at a time to share with friends.", show_alert=True)
         return
 
     await process_send_link_action(
         user_id=callback.from_user.id,
-        url=url,
+        url=urls[0],
         sender_username=callback.from_user.username,
         reply_target=callback.message,
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data == "link_action:cancel")
+async def link_action_cancel(callback: types.CallbackQuery):
+    pending_link_actions.pop(callback.from_user.id, None)
+    await callback.answer("Cancelled.")
 
 
 async def generic_handler(message: types.Message):
@@ -2114,25 +2216,7 @@ async def generic_handler(message: types.Message):
                 return
 
             wishlist_add_mode.discard(user_id)
-            async with aiohttp.ClientSession() as session:
-                for url in urls:
-                    metadata = await _fetch_link_metadata(session, url)
-                    await add_wishlist_item(
-                        user_id,
-                        url,
-                        metadata.get("product_name"),
-                        metadata.get("shop"),
-                        metadata.get("price"),
-                        metadata.get("image_url"),
-                    )
-
-            saved_count = len(urls)
-            saved_text = (
-                "Saved to your wishlist ✅"
-                if saved_count == 1
-                else f"Saved {saved_count} links to your wishlist ✅"
-            )
-            await message.answer(saved_text, reply_markup=wishlist_keyboard())
+            await add_links_to_wishlist(user_id, urls, message)
             await send_editable_wishlist(message, user_id)
             return
 
@@ -2314,12 +2398,19 @@ async def generic_handler(message: types.Message):
             return
 
         # 3) Link sending
-        if text.startswith("http://") or text.startswith("https://"):
-            pending_link_actions[user_id] = text.strip()
-            await message.answer(
-                "What would you like to do with this link?",
-                reply_markup=link_action_keyboard(),
-            )
+        urls = extract_urls_from_text(text)
+        if urls:
+            pending_link_actions[user_id] = urls
+            if len(urls) > 1:
+                await message.answer(
+                    "I found multiple links. I can add them to your wishlist.",
+                    reply_markup=link_action_keyboard(multiple=True),
+                )
+            else:
+                await message.answer(
+                    f"I found this link:\n{urls[0]}\nWhat would you like to do?",
+                    reply_markup=link_action_keyboard(),
+                )
             return
 
         # 4) Fallback
