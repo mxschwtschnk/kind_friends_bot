@@ -99,6 +99,7 @@ delete_account_confirmation = set()  # user_ids awaiting delete confirmation
 wishlist_add_mode = set()  # user_ids adding wishlist entries
 wishlist_delete_confirmations: dict[int, tuple[int, int]] = {}  # user -> (wishlist item, message id)
 pending_link_actions: dict[int, list[str]] = {}  # links sent by user waiting for action
+forwarded_link_collections: dict[int, list[str]] = {}  # aggregated forwarded links awaiting action
 FRIEND_REMOVE_CONFIRM_TEXT = "Yes, remove friend"
 WISHLIST_DELETE_CONFIRM_TEXT = "Yes, delete wish"
 Submenu = Literal[
@@ -708,6 +709,27 @@ def _shorten_url(url: str, max_length: int = 32) -> str:
     if len(trimmed) <= max_length:
         return trimmed
     return trimmed[: max_length - 1] + "…"
+
+
+def _is_forwarded_message(message: types.Message) -> bool:
+    return bool(
+        message.forward_date
+        or message.forward_from
+        or message.forward_from_chat
+        or message.forward_sender_name
+        or getattr(message, "is_automatic_forward", False)
+    )
+
+
+def _deduplicate_urls(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        unique.append(url)
+    return unique
 
 
 def _extract_shop_from_url(url: str) -> str | None:
@@ -1538,11 +1560,11 @@ async def start_feedback_from_menu(message: types.Message):
     )
 
 
-@dp.message(F.text == "⬅️ Back")
-async def back_to_main(message: types.Message):
-    user_id = message.from_user.id
-    user_paused = await is_paused(user_id)
-    current_menu = get_submenu(user_id)
+    @dp.message(F.text == "⬅️ Back")
+    async def back_to_main(message: types.Message):
+        user_id = message.from_user.id
+        user_paused = await is_paused(user_id)
+        current_menu = get_submenu(user_id)
 
     if current_menu == "root":
         add_friend_mode.discard(user_id)
@@ -2366,6 +2388,7 @@ async def process_send_link_action(
 @dp.callback_query(F.data == "link_action:wishlist")
 async def link_action_wishlist(callback: types.CallbackQuery):
     urls = pending_link_actions.pop(callback.from_user.id, None)
+    forwarded_link_collections.pop(callback.from_user.id, None)
     if not urls:
         await callback.answer("Please send a link first.", show_alert=True)
         return
@@ -2382,6 +2405,7 @@ async def link_action_wishlist(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "link_action:send")
 async def link_action_send(callback: types.CallbackQuery):
     urls = pending_link_actions.pop(callback.from_user.id, None)
+    forwarded_link_collections.pop(callback.from_user.id, None)
     if not urls:
         await callback.answer("Please send a link first.", show_alert=True)
         return
@@ -2403,6 +2427,7 @@ async def link_action_send(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "link_action:cancel")
 async def link_action_cancel(callback: types.CallbackQuery):
     pending_link_actions.pop(callback.from_user.id, None)
+    forwarded_link_collections.pop(callback.from_user.id, None)
     await _delete_link_prompt_message(callback.message)
     await callback.answer("Cancelled.")
 
@@ -2416,6 +2441,7 @@ async def generic_handler(message: types.Message):
     """
     user_id = message.from_user.id
     text = message.text or ""
+    is_forwarded = _is_forwarded_message(message)
     user_paused = await is_paused(user_id)
 
     async with LoadingIndicator(message):
@@ -2660,6 +2686,26 @@ async def generic_handler(message: types.Message):
         # 3) Link sending
         urls = extract_urls_from_text(text)
         if urls:
+            if is_forwarded:
+                combined_urls = forwarded_link_collections.get(user_id, []) + urls
+                combined_urls = _deduplicate_urls(combined_urls)
+                forwarded_link_collections[user_id] = combined_urls
+                pending_link_actions[user_id] = combined_urls
+
+                summary_lines = [
+                    "I gathered these links from your forwarded messages:",
+                    *(f"• {url}" for url in combined_urls),
+                    "Add all of them to your wishlist?",
+                ]
+
+                await message.answer(
+                    "\n".join(summary_lines),
+                    reply_markup=link_action_keyboard(multiple=True),
+                    disable_web_page_preview=True,
+                )
+                return
+
+            forwarded_link_collections.pop(user_id, None)
             pending_link_actions[user_id] = urls
             if len(urls) > 1:
                 await message.answer(
@@ -2672,6 +2718,9 @@ async def generic_handler(message: types.Message):
                     reply_markup=link_action_keyboard(),
                 )
             return
+
+        if not is_forwarded:
+            forwarded_link_collections.pop(user_id, None)
 
         # 4) Fallback
         set_submenu(user_id, "root")
