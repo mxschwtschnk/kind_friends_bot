@@ -658,8 +658,11 @@ def remove_friends_keyboard(
 def wishlist_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Add link"), KeyboardButton(text="🗑 Delete item")],
-            [KeyboardButton(text="👀 Show my list")],
+            [
+                KeyboardButton(text="My List"),
+                KeyboardButton(text="Add Link"),
+                KeyboardButton(text="Delete Item"),
+            ],
             [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
@@ -1302,7 +1305,7 @@ async def send_editable_wishlist(
     if count == 0:
         summary_line += "\n\nSend me a link to add your first item."
     else:
-        summary_line += "\n\nUse Add link to save more wishes or Delete item to remove one."
+        summary_line += "\n\nUse Add Link to save more wishes or Delete Item to remove one."
 
     await message.answer(
         summary_line,
@@ -1357,7 +1360,7 @@ async def wishlist_menu(message: types.Message):
     await send_editable_wishlist(message, message.from_user.id)
 
 
-@dp.message(F.text == "➕ Add link")
+@dp.message(F.text == "Add Link")
 async def wishlist_add_prompt(message: types.Message):
     user_id = message.from_user.id
     set_submenu(user_id, "wishlist_add")
@@ -1368,13 +1371,13 @@ async def wishlist_add_prompt(message: types.Message):
     )
 
 
-@dp.message(F.text == "🗑 Delete item")
+@dp.message(F.text == "Delete Item")
 async def wishlist_delete_prompt(message: types.Message):
     set_submenu(message.from_user.id, "wishlist_delete")
     await send_wishlist_items(message, message.from_user.id, delete_mode=True)
 
 
-@dp.message(F.text == "👀 Show my list")
+@dp.message(F.text == "My List")
 async def wishlist_show_message(message: types.Message):
     wishlist_add_mode.discard(message.from_user.id)
     set_submenu(message.from_user.id, "wishlist")
