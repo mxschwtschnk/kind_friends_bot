@@ -88,6 +88,7 @@ get_wishlist_item = database.get_wishlist_item
 delete_wishlist_item = database.delete_wishlist_item
 add_friend_mode = set()  # user_ids who are adding a friend
 remove_friend_mode = set()  # user_ids who are removing a friend
+remove_friend_confirmations: dict[int, str] = {}  # user -> username awaiting confirm
 feedback_mode = set()  # user_ids who are sending feedback
 delete_account_confirmation = set()  # user_ids awaiting delete confirmation
 wishlist_add_mode = set()  # user_ids adding wishlist entries
@@ -1118,29 +1119,13 @@ async def start_feedback_from_menu(message: types.Message):
 
 @dp.message(F.text == "⬅️ Back")
 async def back_to_main(message: types.Message):
-    user_id = message.from_user.id
-    submenu = get_submenu(user_id)
-
-    if submenu in {"friends", "friends_invite", "friends_remove"}:
-        set_submenu(user_id, "friends")
-        await message.answer(
-            "Back to the Friends menu.",
-            reply_markup=friends_keyboard(),
-        )
-        return
-
-    if submenu == "wishlist":
-        await message.answer("Back to your wishlist.", reply_markup=wishlist_keyboard())
-        await send_editable_wishlist(message, user_id)
-        return
-
-    user_paused = await is_paused(user_id)
-    add_friend_mode.discard(user_id)
-    remove_friend_mode.discard(user_id)
-    feedback_mode.discard(user_id)
-    delete_account_confirmation.discard(user_id)
-    wishlist_add_mode.discard(user_id)
-    set_submenu(user_id, "root")
+    user_paused = await is_paused(message.from_user.id)
+    add_friend_mode.discard(message.from_user.id)
+    remove_friend_mode.discard(message.from_user.id)
+    remove_friend_confirmations.pop(message.from_user.id, None)
+    feedback_mode.discard(message.from_user.id)
+    delete_account_confirmation.discard(message.from_user.id)
+    wishlist_add_mode.discard(message.from_user.id)
     await message.answer(
         "Back to the main menu.",
         reply_markup=pause_overlay_keyboard() if user_paused else main_keyboard(False),
@@ -1218,6 +1203,7 @@ async def invite_friends_handler(message: types.Message):
     set_submenu(user_id, "friends_invite")
     add_friend_mode.add(user_id)
     remove_friend_mode.discard(user_id)
+    remove_friend_confirmations.pop(user_id, None)
     invite_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
     await message.answer(
         "Send me your friend's Telegram @username.\n"
@@ -1270,6 +1256,7 @@ async def friends_handler(message: types.Message):
     text += "\n\nChoose an option below."
     add_friend_mode.discard(user_id)
     remove_friend_mode.discard(user_id)
+    remove_friend_confirmations.pop(user_id, None)
     await message.answer(text, parse_mode="Markdown", reply_markup=friends_keyboard())
 
     if friends:
@@ -1293,7 +1280,7 @@ async def remove_friend_handler(message: types.Message):
 
     remove_friend_mode.add(user_id)
     add_friend_mode.discard(user_id)
-    set_submenu(user_id, "friends_remove")
+    remove_friend_confirmations.pop(user_id, None)
     await message.answer(
         "You can now delete your friends from the list.\n"
         "Choose one or a few by clicking on the tags below.",
@@ -1324,14 +1311,19 @@ async def remove_friend_callback(callback: types.CallbackQuery):
         await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
         return
 
+    pending_confirmation = remove_friend_confirmations.get(user_id)
+    if pending_confirmation != friend_username_raw:
+        remove_friend_confirmations[user_id] = friend_username_raw
+        await callback.answer(
+            f"Remove @{friend_username_raw}? Tap again to confirm.", show_alert=True
+        )
+        return
+
+    remove_friend_confirmations.pop(user_id, None)
     await remove_friendship(user_id, friend_tg_id)
     await notify_friend_removed(user_id, friend_tg_id)
 
-    await callback.answer("Friend removed.")
-    await callback.message.answer(
-        f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
-        reply_markup=back_only_keyboard(),
-    )
+    await callback.answer("Friend removed.", show_alert=True)
 
     updated_friends = await get_friend_usernames(user_id)
     if updated_friends:
@@ -1342,19 +1334,13 @@ async def remove_friend_callback(callback: types.CallbackQuery):
         except Exception as e:  # noqa: BLE001
             print(f"[WARN] Failed to refresh removal keyboard for {user_id}: {e}")
     else:
-        remove_friend_mode.discard(user_id)
         try:
             await callback.message.edit_text(
-                "You don't have any friends connected yet.\nTap “➕ Invite” to add someone.",
+                "You removed all friends. Tap ⬅️ Back to exit remove mode.",
                 reply_markup=None,
             )
         except Exception as e:  # noqa: BLE001
             print(f"[WARN] Failed to update empty removal message for {user_id}: {e}")
-        set_submenu(user_id, "friends")
-        await callback.message.answer(
-            "Friend list is empty now. Returning to Friends menu.",
-            reply_markup=friends_keyboard(),
-        )
 
 
 @dp.callback_query(F.data.startswith("wishlist_item:"))
@@ -1975,12 +1961,11 @@ async def generic_handler(message: types.Message):
 
         # 1.5) Remove friend mode
         if user_id in remove_friend_mode:
-            remove_friend_mode.discard(user_id)
             friend_username_raw = normalize_username_input(text)
             if not friend_username_raw:
                 await message.answer(
                     "Please send a valid @username to remove a friend.",
-                    reply_markup=friends_keyboard(),
+                    reply_markup=back_only_keyboard(),
                 )
                 return
 
@@ -1988,7 +1973,7 @@ async def generic_handler(message: types.Message):
             if not friend_tg_id:
                 await message.answer(
                     "I can't find this friend in Kind Friends.",
-                    reply_markup=friends_keyboard(),
+                    reply_markup=back_only_keyboard(),
                 )
                 return
 
@@ -1996,8 +1981,19 @@ async def generic_handler(message: types.Message):
             await notify_friend_removed(user_id, friend_tg_id)
             await message.answer(
                 f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
-                reply_markup=friends_keyboard(),
+                reply_markup=back_only_keyboard(),
             )
+            updated_friends = await get_friend_usernames(user_id)
+            if updated_friends:
+                await message.answer(
+                    "Tap a friend to remove them:",
+                    reply_markup=remove_friends_keyboard(updated_friends),
+                )
+            else:
+                await message.answer(
+                    "You removed all friends. Tap ⬅️ Back to exit remove mode.",
+                    reply_markup=back_only_keyboard(),
+                )
             return
 
         # 2) Remove friend: -@username
