@@ -89,6 +89,9 @@ class Database:
                     product_name TEXT,
                     price TEXT,
                     image_url TEXT,
+                    reserved_by_telegram_id BIGINT,
+                    reserved_at TIMESTAMPTZ,
+                    got_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 """
@@ -106,6 +109,14 @@ class Database:
                 ADD COLUMN IF NOT EXISTS product_name TEXT,
                 ADD COLUMN IF NOT EXISTS price TEXT,
                 ADD COLUMN IF NOT EXISTS image_url TEXT;
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE wishlists
+                ADD COLUMN IF NOT EXISTS reserved_by_telegram_id BIGINT,
+                ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS got_at TIMESTAMPTZ;
                 """
             )
             await conn.execute(
@@ -631,9 +642,12 @@ class Database:
                     product_name,
                     shop,
                     price,
-                    image_url
+                    image_url,
+                    reserved_by_telegram_id,
+                    reserved_at,
+                    got_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL)
                 RETURNING id;
                 """,
                 owner_id,
@@ -646,12 +660,23 @@ class Database:
             )
         return int(row["id"])
 
-    async def get_wishlist_items(self, owner_id: int):
+    async def get_wishlist_items(self, owner_id: int, viewer_id: int | None = None):
         if not self.pool:
             raise RuntimeError("Pool not initialized")
+
+        conditions = ["owner_telegram_id = $1"]
+        params: list[int | None] = [owner_id]
+
+        if viewer_id is None or viewer_id == owner_id:
+            conditions.append("got_at IS NULL")
+        else:
+            conditions.append(
+                "got_at IS NULL AND (reserved_by_telegram_id IS NULL OR reserved_by_telegram_id = $2)"
+            )
+            params.append(viewer_id)
+
         async with self.pool.acquire() as conn:
-            return await conn.fetch(
-                """
+            query = f"""
                 SELECT
                     id,
                     owner_telegram_id,
@@ -661,13 +686,16 @@ class Database:
                     shop,
                     price,
                     image_url,
+                    reserved_by_telegram_id,
+                    reserved_at,
+                    got_at,
                     created_at
                 FROM wishlists
-                WHERE owner_telegram_id = $1
+                WHERE {' AND '.join(conditions)}
                 ORDER BY created_at ASC;
-                """,
-                owner_id,
-            )
+            """
+
+            return await conn.fetch(query, *params)
 
     async def get_wishlist_item(self, item_id: int):
         if not self.pool:
@@ -684,6 +712,9 @@ class Database:
                     shop,
                     price,
                     image_url,
+                    reserved_by_telegram_id,
+                    reserved_at,
+                    got_at,
                     created_at
                 FROM wishlists
                 WHERE id = $1;
@@ -698,8 +729,59 @@ class Database:
             await conn.execute(
                 """
                 DELETE FROM wishlists
-                WHERE id = $1 AND owner_telegram_id = $2;
+                WHERE id = $1 AND owner_telegram_id = $2 AND reserved_by_telegram_id IS NULL;
                 """,
                 item_id,
                 owner_id,
             )
+
+    async def reserve_wishlist_item(self, item_id: int, reserver_id: int) -> bool:
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE wishlists
+                SET reserved_by_telegram_id = $1, reserved_at = $2
+                WHERE id = $3
+                  AND got_at IS NULL
+                  AND (reserved_by_telegram_id IS NULL OR reserved_by_telegram_id = $1);
+                """,
+                reserver_id,
+                datetime.now(),
+                item_id,
+            )
+        return result.split(" ")[-1] != "0"
+
+    async def unreserve_wishlist_item(self, item_id: int, reserver_id: int) -> bool:
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE wishlists
+                SET reserved_by_telegram_id = NULL, reserved_at = NULL
+                WHERE id = $1
+                  AND got_at IS NULL
+                  AND reserved_by_telegram_id = $2;
+                """,
+                item_id,
+                reserver_id,
+            )
+        return result.split(" ")[-1] != "0"
+
+    async def mark_wishlist_item_gotten(self, owner_id: int, item_id: int) -> bool:
+        if not self.pool:
+            raise RuntimeError("Pool not initialized")
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE wishlists
+                SET got_at = $1
+                WHERE id = $2 AND owner_telegram_id = $3 AND got_at IS NULL;
+                """,
+                datetime.now(),
+                item_id,
+                owner_id,
+            )
+        return result.split(" ")[-1] != "0"
