@@ -96,6 +96,8 @@ delete_account_confirmation = set()  # user_ids awaiting delete confirmation
 wishlist_add_mode = set()  # user_ids adding wishlist entries
 wishlist_delete_confirmations: dict[int, tuple[int, int]] = {}  # user -> (wishlist item, message id)
 pending_link_actions: dict[int, list[str]] = {}  # links sent by user waiting for action
+FRIEND_REMOVE_CONFIRM_TEXT = "Yes, remove friend"
+WISHLIST_DELETE_CONFIRM_TEXT = "Yes, delete wish"
 Submenu = Literal[
     "root",
     "friends",
@@ -625,33 +627,23 @@ def back_only_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def remove_friends_keyboard(
-    friends: list[str], confirming: str | None = None
-) -> InlineKeyboardMarkup:
-    buttons = []
-    for username in friends:
-        if confirming == username:
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text="Yes, remove",
-                        callback_data=f"remove_friend_confirm:{username}",
-                    ),
-                    InlineKeyboardButton(
-                        text="No, save",
-                        callback_data="remove_friend_cancel",
-                    ),
-                ]
-            )
-        else:
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"@{username}",
-                        callback_data=f"remove_friend:{username}",
-                    )
-                ]
-            )
+def confirmation_keyboard(
+    confirm_text: str, cancel_text: str = "Cancel"
+) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=confirm_text)],
+            [KeyboardButton(text=cancel_text)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def remove_friends_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=f"@{username}", callback_data=f"remove_friend:{username}")]
+        for username in friends
+    ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -694,20 +686,6 @@ def friend_options_keyboard(username: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Remove", callback_data=f"friend_remove:{username}")],
             [InlineKeyboardButton(text="🎁 Wishlist", callback_data=f"friend_wishlist:{username}")],
-        ]
-    )
-
-
-def friend_remove_confirmation_keyboard(username: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Yes, remove",
-                    callback_data=f"friend_card_remove_confirm:{username}",
-                )
-            ],
-            [InlineKeyboardButton(text="No, save", callback_data="friend_card_remove_cancel")],
         ]
     )
 
@@ -1084,19 +1062,6 @@ def wishlist_item_action_keyboard(item) -> InlineKeyboardMarkup:
     )
 
 
-def wishlist_delete_confirmation_keyboard(item_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Yes, delete", callback_data=f"wishlist_delete_confirm:{item_id}"
-                )
-            ],
-            [InlineKeyboardButton(text="No, save", callback_data="wishlist_delete_cancel")],
-        ]
-    )
-
-
 def wishlist_item_delete_button(item_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Delete", callback_data=f"wishlist_delete:{item_id}")]]
@@ -1140,39 +1105,61 @@ async def _confirm_or_delete_wishlist_item(
         await callback.answer("This wishlist item is no longer available.", show_alert=True)
         return
 
-    delete_mode = get_submenu(callback.from_user.id) == "wishlist_delete"
-    saved_confirmation = wishlist_delete_confirmations.pop(callback.from_user.id, None)
-
-    if delete_mode or callback.data.startswith("wishlist_delete_confirm:"):
-        await delete_wishlist_item(callback.from_user.id, item_id)
-        target_message_id = None
-        if saved_confirmation and isinstance(saved_confirmation, tuple):
-            _, target_message_id = saved_confirmation
-
-        if not target_message_id:
-            target_message_id = callback.message.message_id
-
-        try:
-            await bot.delete_message(callback.message.chat.id, target_message_id)
-        except Exception as e:  # noqa: BLE001
-            print(f"[WARN] Failed to delete wishlist item message {target_message_id}: {e}")
-            await _remove_wishlist_item_button(callback.message, item_id)
-
-        if callback.message.message_id != target_message_id:
-            try:
-                await callback.message.delete()
-            except Exception as e:  # noqa: BLE001
-                print(f"[WARN] Failed to delete wishlist confirmation message: {e}")
-
-        await callback.answer("Wishlist item deleted.")
-        return
-
+    wishlist_delete_confirmations.pop(callback.from_user.id, None)
     wishlist_delete_confirmations[callback.from_user.id] = (item_id, callback.message.message_id)
     await callback.message.answer(
         f"Are you sure you want to delete this wishlist item?\n{item['url']}",
-        reply_markup=wishlist_delete_confirmation_keyboard(item_id),
+        reply_markup=confirmation_keyboard(WISHLIST_DELETE_CONFIRM_TEXT),
+        disable_web_page_preview=True,
     )
     await callback.answer()
+
+
+async def _delete_wishlist_item_from_confirmation(message: types.Message) -> None:
+    user_id = message.from_user.id
+    saved_confirmation = wishlist_delete_confirmations.pop(user_id, None)
+
+    if not saved_confirmation:
+        await message.answer(
+            "No wishlist item is pending deletion.", reply_markup=wishlist_keyboard()
+        )
+        return
+
+    if isinstance(saved_confirmation, tuple):
+        item_id, target_message_id = saved_confirmation
+    else:
+        item_id = int(saved_confirmation)
+        target_message_id = None
+
+    item = await get_wishlist_item(item_id)
+    if not item or item.get("owner_telegram_id") != user_id:
+        await message.answer(
+            "This wishlist item is no longer available.",
+            reply_markup=wishlist_keyboard(),
+        )
+        return
+
+    await delete_wishlist_item(user_id, item_id)
+
+    if not target_message_id:
+        target_message_id = message.message_id
+
+    try:
+        await bot.delete_message(message.chat.id, target_message_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to delete wishlist item message {target_message_id}: {e}")
+        await _remove_wishlist_item_button(message, item_id)
+
+    reply_markup = (
+        back_only_keyboard()
+        if get_submenu(user_id) == "wishlist_delete"
+        else wishlist_keyboard()
+    )
+
+    await message.answer("Wishlist item deleted.", reply_markup=reply_markup)
+
+    if get_submenu(user_id) == "wishlist_delete":
+        await send_wishlist_items(message, user_id, delete_mode=True)
 # -------------------------------------------------------------------
 # FEEDBACK
 # -------------------------------------------------------------------
@@ -1326,7 +1313,7 @@ async def send_wishlist_items(
 
     if delete_mode:
         await message.answer(
-            "Delete mode: tap Delete below any item to remove it immediately.",
+            "Delete mode: tap Delete below any item, then confirm using the keyboard.",
             reply_markup=back_only_keyboard(),
         )
 
@@ -1670,16 +1657,63 @@ async def remove_friend_callback(callback: types.CallbackQuery):
         return
 
     remove_friend_confirmations[user_id] = friend_username_raw
-    await callback.answer(f"Remove @{friend_username_raw}?", show_alert=True)
+    await callback.message.answer(
+        f"Remove @{friend_username_raw}?",
+        reply_markup=confirmation_keyboard(FRIEND_REMOVE_CONFIRM_TEXT),
+    )
+    await callback.answer()
 
-    try:
-        await callback.message.edit_reply_markup(
-            reply_markup=remove_friends_keyboard(
-                friends, confirming=friend_username_raw
-            )
+
+async def _finalize_friend_removal(
+    user_id: int, friend_username_raw: str, reply_target: types.Message
+) -> None:
+    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
+    if not friend_tg_id:
+        await reply_target.answer(
+            "I can't find this friend in Kind Friends.",
+            reply_markup=friends_keyboard(),
         )
-    except Exception as e:  # noqa: BLE001
-        print(f"[WARN] Failed to show removal confirmation for {user_id}: {e}")
+        return
+
+    friends_ids = await get_all_friend_ids(user_id)
+    if friend_tg_id not in friends_ids:
+        await reply_target.answer(
+            "You are no longer connected with this friend.",
+            reply_markup=friends_keyboard(),
+        )
+        return
+
+    remove_friend_confirmations.pop(user_id, None)
+    friend_card_remove_confirmations.pop(user_id, None)
+
+    await remove_friendship(user_id, friend_tg_id)
+    await notify_friend_removed(user_id, friend_tg_id)
+
+    in_remove_mode = user_id in remove_friend_mode
+    updated_friends = await get_friend_usernames(user_id)
+
+    if in_remove_mode:
+        await reply_target.answer(
+            f"Removed @{friend_username_raw}.",
+            reply_markup=back_only_keyboard(),
+        )
+        if updated_friends:
+            await reply_target.answer(
+                "Select a friend to remove.",
+                reply_markup=remove_friends_keyboard(updated_friends),
+            )
+        else:
+            remove_friend_mode.discard(user_id)
+            await reply_target.answer(
+                "You have no other friends to remove.",
+                reply_markup=friends_keyboard(),
+            )
+    else:
+        set_submenu(user_id, "friends")
+        await reply_target.answer(
+            f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
+            reply_markup=friends_keyboard(),
+        )
 
 
 @dp.callback_query(F.data.startswith("remove_friend_confirm:"))
@@ -1700,27 +1734,8 @@ async def remove_friend_confirm_callback(callback: types.CallbackQuery):
     if pending_confirmation != friend_username_raw:
         await callback.answer("Please select a friend to remove first.", show_alert=True)
         return
-
-    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-    if not friend_tg_id:
-        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
-        return
-
-    remove_friend_confirmations.pop(user_id, None)
-    await remove_friendship(user_id, friend_tg_id)
-    await notify_friend_removed(user_id, friend_tg_id)
-
-    updated_friends = await get_friend_usernames(user_id)
-    await callback.answer("Removed.")
-
-    try:
-        await callback.message.edit_reply_markup(
-            reply_markup=remove_friends_keyboard(updated_friends)
-            if updated_friends
-            else None
-        )
-    except Exception as e:  # noqa: BLE001
-        print(f"[WARN] Failed to refresh removal keyboard for {user_id}: {e}")
+    await _finalize_friend_removal(user_id, friend_username_raw, callback.message)
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "remove_friend_cancel")
@@ -1734,14 +1749,61 @@ async def remove_friend_cancel_callback(callback: types.CallbackQuery):
     remove_friend_confirmations.pop(user_id, None)
     friends = await get_friend_usernames(user_id)
 
-    await callback.answer("Cancelled.")
-
-    try:
-        await callback.message.edit_reply_markup(
-            reply_markup=remove_friends_keyboard(friends) if friends else None
+    await callback.message.answer(
+        "Cancelled.", reply_markup=back_only_keyboard()
+    )
+    if friends:
+        await callback.message.answer(
+            "Select a friend to remove.", reply_markup=remove_friends_keyboard(friends)
         )
-    except Exception as e:  # noqa: BLE001
-        print(f"[WARN] Failed to refresh removal keyboard for {user_id}: {e}")
+    await callback.answer()
+
+
+@dp.message(F.text == FRIEND_REMOVE_CONFIRM_TEXT)
+async def remove_friend_from_keyboard(message: types.Message):
+    user_id = message.from_user.id
+    pending_username = remove_friend_confirmations.get(user_id) or friend_card_remove_confirmations.get(user_id)
+
+    if not pending_username:
+        await message.answer(
+            "No friend is awaiting removal.", reply_markup=friends_keyboard()
+        )
+        return
+
+    await _finalize_friend_removal(user_id, pending_username, message)
+
+
+@dp.message(F.text == "Cancel")
+async def cancel_pending_confirmation(message: types.Message):
+    user_id = message.from_user.id
+    handled = False
+
+    if remove_friend_confirmations.pop(user_id, None) or friend_card_remove_confirmations.pop(user_id, None):
+        handled = True
+        friends = await get_friend_usernames(user_id)
+        if user_id in remove_friend_mode and friends:
+            await message.answer(
+                "Cancelled.", reply_markup=back_only_keyboard()
+            )
+            await message.answer(
+                "Select a friend to remove.", reply_markup=remove_friends_keyboard(friends)
+            )
+        else:
+            await message.answer(
+                "Friend removal cancelled.", reply_markup=friends_keyboard()
+            )
+
+    if wishlist_delete_confirmations.pop(user_id, None):
+        handled = True
+        reply_markup = (
+            back_only_keyboard()
+            if get_submenu(user_id) == "wishlist_delete"
+            else wishlist_keyboard()
+        )
+        await message.answer("Deletion cancelled.", reply_markup=reply_markup)
+
+    if not handled:
+        await message.answer("Nothing to cancel.")
 
 
 @dp.callback_query(F.data.startswith("wishlist_item:"))
@@ -1785,6 +1847,11 @@ async def wishlist_delete_cancel_callback(callback: types.CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception as e:  # noqa: BLE001
         print(f"[WARN] Failed to clear wishlist deletion prompt: {e}")
+
+
+@dp.message(F.text == WISHLIST_DELETE_CONFIRM_TEXT)
+async def wishlist_delete_via_keyboard(message: types.Message):
+    await _delete_wishlist_item_from_confirmation(message)
 
 
 @dp.callback_query(F.data == "wishlist_show")
@@ -1841,7 +1908,7 @@ async def friend_remove_from_card(callback: types.CallbackQuery):
     friend_card_remove_confirmations[user_id] = friend_username_raw
     await callback.message.answer(
         f"Are you sure you want to remove @{friend_username_raw}?",
-        reply_markup=friend_remove_confirmation_keyboard(friend_username_raw),
+        reply_markup=confirmation_keyboard(FRIEND_REMOVE_CONFIRM_TEXT),
     )
     await callback.answer()
 
@@ -1859,27 +1926,8 @@ async def friend_remove_from_card_confirm(callback: types.CallbackQuery):
     if pending_username != friend_username_raw:
         await callback.answer("Please start the removal again from the friends list.", show_alert=True)
         return
-
-    friend_tg_id = await get_telegram_id_by_username(friend_username_raw)
-    if not friend_tg_id:
-        await callback.answer("I can't find this friend in Kind Friends.", show_alert=True)
-        return
-
-    friends_ids = await get_all_friend_ids(user_id)
-    if friend_tg_id not in friends_ids:
-        await callback.answer("You are no longer connected with this friend.", show_alert=True)
-        return
-
-    friend_card_remove_confirmations.pop(user_id, None)
-    await remove_friendship(user_id, friend_tg_id)
-    await notify_friend_removed(user_id, friend_tg_id)
-
-    await callback.answer("Friend removed.")
-    set_submenu(user_id, "friends")
-    await callback.message.answer(
-        f"You are no longer connected with @{friend_username_raw} on Kind Friends.",
-        reply_markup=friends_keyboard(),
-    )
+    await _finalize_friend_removal(user_id, friend_username_raw, callback.message)
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "friend_card_remove_cancel")
