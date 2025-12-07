@@ -599,8 +599,11 @@ def pause_overlay_keyboard() -> ReplyKeyboardMarkup:
 def friends_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Invite"), KeyboardButton(text="Remove")],
-            [KeyboardButton(text="My Friends")],
+            [
+                KeyboardButton(text="My Friends"),
+                KeyboardButton(text="Invite"),
+                KeyboardButton(text="Remove"),
+            ],
             [KeyboardButton(text="⬅️ Back")],
         ],
         resize_keyboard=True,
@@ -1719,7 +1722,7 @@ async def friends_handler(message: types.Message):
     max_friends = get_max_friends(settings, user_id)
     text = (
         f"You have {friend_count}/{max_friends} friends.\n\n"
-        "Use Invite to get invitation Link or Remove to unfollow your friends."
+        "Use Invite to get invitation link or Remove to unfollow your friends."
     )
     add_friend_mode.discard(user_id)
     remove_friend_mode.discard(user_id)
