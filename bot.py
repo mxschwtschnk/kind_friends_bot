@@ -1564,11 +1564,11 @@ async def start_feedback_from_menu(message: types.Message):
     )
 
 
-    @dp.message(F.text == "⬅️ Back")
-    async def back_to_main(message: types.Message):
-        user_id = message.from_user.id
-        user_paused = await is_paused(user_id)
-        current_menu = get_submenu(user_id)
+@dp.message(F.text == "⬅️ Back")
+async def back_to_main(message: types.Message):
+    user_id = message.from_user.id
+    user_paused = await is_paused(user_id)
+    current_menu = get_submenu(user_id)
 
     if current_menu == "root":
         add_friend_mode.discard(user_id)
