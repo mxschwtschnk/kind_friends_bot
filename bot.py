@@ -609,7 +609,12 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
                 "User-Agent": (
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-                )
+                ),
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;"
+                    "q=0.9,image/avif,image/webp,*/*;q=0.8"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
             },
         ) as response:
             if response.status >= 400:
@@ -627,9 +632,16 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
     def _clean_title(title: str | None) -> str | None:
         if not title:
             return None
-        for sep in (" | ", " – ", " — ", " - "):
-            if sep in title:
-                return title.split(sep)[0].strip() or title.strip()
+
+        # Prefer the most descriptive portion (usually the product) when stores include
+        # their brand in the page title. Choose the longest non-empty chunk to avoid
+        # returning only the shop name (e.g., "Store | Product" -> "Product").
+        parts = re.split(r"\s+[\-|–|—]\s+|\s*\|\s*", title)
+        parts = [p.strip() for p in parts if p and p.strip()]
+        if parts:
+            parts.sort(key=len, reverse=True)
+            return parts[0]
+
         return title.strip()
 
     def _extract_product_from_ld_json():
@@ -699,7 +711,15 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
         title = _search_title_tag()
     title = _clean_title(title)
 
-    image = structured.get("image") or _search_meta(("og:image", "twitter:image", "twitter:image:src"))
+    image = structured.get("image") or _search_meta(
+        (
+            "og:image",
+            "og:image:secure_url",
+            "twitter:image",
+            "twitter:image:src",
+            "twitter:image:alt",
+        )
+    )
     if image:
         image = urljoin(url, image)
 
