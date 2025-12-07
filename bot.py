@@ -101,15 +101,31 @@ Submenu = Literal[
     "help",
     "wishlist",
 ]
-current_submenu: dict[int, Submenu] = {}
+current_submenu: dict[int, list[Submenu]] = {}
 
 
 def set_submenu(user_id: int, submenu: Submenu) -> None:
-    current_submenu[user_id] = submenu
+    history = current_submenu.setdefault(user_id, ["root"])
+    if submenu == "root":
+        current_submenu[user_id] = ["root"]
+        return
+
+    if history[-1] != submenu:
+        history.append(submenu)
 
 
 def get_submenu(user_id: int) -> Submenu:
-    return current_submenu.get(user_id, "root")
+    return current_submenu.get(user_id, ["root"])[-1]
+
+
+def pop_submenu(user_id: int) -> Submenu:
+    history = current_submenu.get(user_id, ["root"])
+    if len(history) <= 1:
+        current_submenu[user_id] = ["root"]
+        return "root"
+
+    history.pop()
+    return history[-1]
 
 
 class LoadingIndicator:
@@ -1090,6 +1106,7 @@ async def send_editable_wishlist(
 @dp.message(F.text == "📜 Wishlist")
 async def wishlist_menu(message: types.Message):
     wishlist_add_mode.discard(message.from_user.id)
+    set_submenu(message.from_user.id, "wishlist")
     await send_editable_wishlist(message, message.from_user.id)
 
 
@@ -1182,17 +1199,53 @@ async def start_feedback_from_menu(message: types.Message):
 
 @dp.message(F.text == "⬅️ Back")
 async def back_to_main(message: types.Message):
-    user_paused = await is_paused(message.from_user.id)
-    add_friend_mode.discard(message.from_user.id)
-    remove_friend_mode.discard(message.from_user.id)
-    remove_friend_confirmations.pop(message.from_user.id, None)
-    feedback_mode.discard(message.from_user.id)
-    delete_account_confirmation.discard(message.from_user.id)
-    wishlist_add_mode.discard(message.from_user.id)
-    await message.answer(
-        "Back to the main menu.",
-        reply_markup=pause_overlay_keyboard() if user_paused else main_keyboard(False),
-    )
+    user_id = message.from_user.id
+    user_paused = await is_paused(user_id)
+    current_menu = get_submenu(user_id)
+
+    if current_menu == "root":
+        add_friend_mode.discard(user_id)
+        remove_friend_mode.discard(user_id)
+        remove_friend_confirmations.pop(user_id, None)
+        feedback_mode.discard(user_id)
+        delete_account_confirmation.discard(user_id)
+        wishlist_add_mode.discard(user_id)
+        await message.answer(
+            "Back to the main menu.",
+            reply_markup=pause_overlay_keyboard()
+            if user_paused
+            else main_keyboard(False),
+        )
+        return
+
+    target_menu = pop_submenu(user_id)
+
+    if target_menu == "friends":
+        add_friend_mode.discard(user_id)
+        remove_friend_mode.discard(user_id)
+        remove_friend_confirmations.pop(user_id, None)
+        await message.answer("Back to Friends.", reply_markup=friends_keyboard())
+    elif target_menu == "wishlist":
+        wishlist_add_mode.discard(user_id)
+        await message.answer("Back to Wishlist.", reply_markup=wishlist_keyboard())
+    elif target_menu == "help":
+        feedback_mode.discard(user_id)
+        delete_account_confirmation.discard(user_id)
+        await message.answer("Back to Help.", reply_markup=help_keyboard())
+    else:
+        add_friend_mode.discard(user_id)
+        remove_friend_mode.discard(user_id)
+        remove_friend_confirmations.pop(user_id, None)
+        feedback_mode.discard(user_id)
+        delete_account_confirmation.discard(user_id)
+        wishlist_add_mode.discard(user_id)
+        set_submenu(user_id, "root")
+        await message.answer(
+            "Back to the main menu.",
+            reply_markup=pause_overlay_keyboard()
+            if user_paused
+            else main_keyboard(False),
+        )
 
 
 @dp.message(F.text == "⏸ Pause")
@@ -1314,6 +1367,7 @@ async def friends_handler(message: types.Message):
 @dp.message(F.text == "➖ Remove")
 async def remove_friend_handler(message: types.Message):
     user_id = message.from_user.id
+    set_submenu(user_id, "friends_remove")
     friends = await get_friend_usernames(user_id)
 
     if not friends:
