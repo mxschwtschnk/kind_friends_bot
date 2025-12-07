@@ -90,6 +90,7 @@ remove_friend_mode = set()  # user_ids who are removing a friend
 feedback_mode = set()  # user_ids who are sending feedback
 delete_account_confirmation = set()  # user_ids awaiting delete confirmation
 wishlist_add_mode = set()  # user_ids adding wishlist entries
+pending_link_actions: dict[int, str] = {}  # last link sent by user waiting for action
 
 
 class LoadingIndicator:
@@ -572,6 +573,19 @@ def remove_friends_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
 
 def wishlist_keyboard() -> ReplyKeyboardMarkup:
     return back_only_keyboard()
+
+
+def link_action_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Add to 🎁", callback_data="link_action:wishlist"
+                ),
+                InlineKeyboardButton(text="Send to 👥", callback_data="link_action:send"),
+            ]
+        ]
+    )
 
 
 def friend_list_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
@@ -1529,6 +1543,118 @@ async def wipe_me_handler(message: types.Message):
     )
 
 
+async def process_send_link_action(
+    user_id: int, url: str, sender_username: str | None, reply_target: types.Message
+):
+    recent_sent_at = await get_recent_sent_link_timestamp(user_id, url)
+    if recent_sent_at:
+        retry_after = recent_sent_at + timedelta(days=7)
+        now = datetime.now(timezone.utc)
+        if now < retry_after:
+            remaining_seconds = (retry_after - now).total_seconds()
+            remaining_days = max(1, math.ceil(remaining_seconds / 86400))
+            await reply_target.answer(
+                "You already shared this link recently.\n"
+                f"Please wait {remaining_days} day(s) before sending it again to avoid spam.",
+            )
+            return
+
+    paused = await is_paused(user_id)
+    if paused:
+        await reply_target.answer(
+            "You are currently on pause.\n"
+            "Tap ▶️ Resume if you want to send and receive links again.",
+        )
+        return
+
+    daily_sent = await get_daily_sent_links_count(user_id)
+    if daily_sent >= MAX_DAILY_LINKS:
+        await reply_target.answer(
+            "You have reached the daily limit of 5 links.\n"
+            "0/5 links are left for today.",
+        )
+        return
+
+    friends_ids = await get_all_friend_ids(user_id)
+    sender_username = sender_username or "your friend"
+    sent_count = 0
+    stored_count = 0
+
+    for fid in friends_ids:
+        try:
+            if await is_paused(fid):
+                await save_pending_link(fid, user_id, url)
+                stored_count += 1
+            else:
+                await bot.send_message(
+                    fid,
+                    f"@{sender_username} shared a link with you:\n{url}",
+                )
+                sent_count += 1
+        except Exception as e:
+            print(f"[WARN] Failed to deliver link to {fid}: {e}")
+
+    new_daily_total = await increment_sent_links(user_id)
+    await record_sent_link(user_id, url)
+
+    remaining_links = max(0, MAX_DAILY_LINKS - new_daily_total)
+    remaining_text = (
+        f"You have {remaining_links}/{MAX_DAILY_LINKS} link(s) left for today."
+        if remaining_links > 0
+        else "You have 0/5 links left for today."
+    )
+
+    if sent_count == 0 and stored_count == 0:
+        await reply_target.answer(
+            "Got your link ✅\n"
+            "Right now you don't have any friends to send it to.\n"
+            f"{remaining_text}"
+        )
+        return
+
+    parts = ["Got your link ✅"]
+    if sent_count:
+        parts.append(f"Sent to {sent_count} active friend(s).")
+    if stored_count:
+        parts.append(f"Saved for {stored_count} friend(s) who are on pause.")
+    parts.append(remaining_text)
+    await reply_target.answer("\n".join(parts))
+
+
+@dp.callback_query(F.data == "link_action:wishlist")
+async def link_action_wishlist(callback: types.CallbackQuery):
+    url = pending_link_actions.pop(callback.from_user.id, None)
+    if not url:
+        await callback.answer("Please send a link first.", show_alert=True)
+        return
+
+    async with aiohttp.ClientSession() as session:
+        title = await _fetch_title_for_url(session, url)
+    await add_wishlist_item(callback.from_user.id, url, title)
+    await callback.message.answer(
+        "Saved to your wishlist ✅",
+        reply_markup=wishlist_keyboard(),
+    )
+    await send_editable_wishlist(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "link_action:send")
+async def link_action_send(callback: types.CallbackQuery):
+    url = pending_link_actions.pop(callback.from_user.id, None)
+    if not url:
+        await callback.answer("Please send a link first.", show_alert=True)
+        return
+
+    await process_send_link_action(
+        user_id=callback.from_user.id,
+        url=url,
+        sender_username=callback.from_user.username,
+        reply_target=callback.message,
+    )
+    await callback.answer()
+
+
 async def generic_handler(message: types.Message):
     """
     Generic handler:
@@ -1825,75 +1951,11 @@ async def generic_handler(message: types.Message):
 
         # 3) Link sending
         if text.startswith("http://") or text.startswith("https://"):
-            recent_sent_at = await get_recent_sent_link_timestamp(user_id, text)
-            if recent_sent_at:
-                retry_after = recent_sent_at + timedelta(days=7)
-                now = datetime.now(timezone.utc)
-                if now < retry_after:
-                    remaining_seconds = (retry_after - now).total_seconds()
-                    remaining_days = max(1, math.ceil(remaining_seconds / 86400))
-                    await message.answer(
-                        "You already shared this link recently.\n"
-                        f"Please wait {remaining_days} day(s) before sending it again to avoid spam.",
-                    )
-                    return
-
-            paused = user_paused
-            if paused:
-                await message.answer(
-                    "You are currently on pause.\n"
-                    "Tap ▶️ Resume if you want to send and receive links again."
-                )
-                return
-
-            daily_sent = await get_daily_sent_links_count(user_id)
-            if daily_sent >= MAX_DAILY_LINKS:
-                await message.answer(
-                    "You have reached the daily limit of 5 links.\n"
-                    "0/5 links are left for today.",
-                )
-                return
-
-            friends_ids = await get_all_friend_ids(user_id)
-            sender_username = message.from_user.username or "your friend"
-            sent_count = 0
-            stored_count = 0
-
-            for fid in friends_ids:
-                try:
-                    if await is_paused(fid):
-                        await save_pending_link(fid, user_id, text)
-                        stored_count += 1
-                    else:
-                        await bot.send_message(
-                            fid,
-                            f"@{sender_username} shared a link with you:\n{text}",
-                        )
-                        sent_count += 1
-                except Exception as e:
-                    print(f"[WARN] Failed to deliver link to {fid}: {e}")
-
-            # increment personal counter
-            new_daily_total = await increment_sent_links(user_id)
-            await record_sent_link(user_id, text)
-
-            remaining_links = max(0, MAX_DAILY_LINKS - new_daily_total)
-            remaining_text = f"{remaining_links}/{MAX_DAILY_LINKS} links are left for today."
-
-            if sent_count == 0 and stored_count == 0:
-                await message.answer(
-                    "Got your link ✅\n"
-                    "Right now you don't have any friends to send it to.\n"
-                    f"{remaining_text}"
-                )
-            else:
-                parts = ["Got your link ✅"]
-                if sent_count:
-                    parts.append(f"Sent to {sent_count} active friend(s).")
-                if stored_count:
-                    parts.append(f"Saved for {stored_count} friend(s) who are on pause.")
-                parts.append(remaining_text)
-                await message.answer("\n".join(parts))
+            pending_link_actions[user_id] = text.strip()
+            await message.answer(
+                "What would you like to do with this link?",
+                reply_markup=link_action_keyboard(),
+            )
             return
 
         # 4) Fallback
