@@ -530,18 +530,23 @@ def display_username(username: str | None, fallback: str = "friend") -> str:
     return f"@{username}" if username else fallback
 
 def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
-    if paused:
-        keyboard = [
-            [KeyboardButton(text="👥 Friends"), KeyboardButton(text="📜 Wishlist")],
-            [KeyboardButton(text="▶️ Resume"), KeyboardButton(text="ℹ️ Help")],
-        ]
-    else:
-        keyboard = [
-            [KeyboardButton(text="👥 Friends"), KeyboardButton(text="📜 Wishlist")],
-            [KeyboardButton(text="⏸ Pause"), KeyboardButton(text="ℹ️ Help")],
-        ]
+    pause_button = KeyboardButton(text="▶️ Resume") if paused else KeyboardButton(text="⏸ Pause")
+    keyboard = [
+        [pause_button, KeyboardButton(text="👥 Friends"), KeyboardButton(text="📜 Wishlist")],
+        [KeyboardButton(text="ℹ️ Help")],
+    ]
 
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+def pause_overlay_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="▶️ Resume")],
+            [KeyboardButton(text="ℹ️ Help")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def friends_keyboard() -> ReplyKeyboardMarkup:
@@ -982,7 +987,7 @@ async def cmd_start(message: types.Message):
         "• Use the buttons to open Friends, Pause/Resume, or get more information in Help.\n\n"
         "*This is an MVP version. Your feedback is very welcome!*\n"
         + invite_note,
-        reply_markup=main_keyboard(paused),
+        reply_markup=pause_overlay_keyboard() if paused else main_keyboard(False),
     )
 
 
@@ -1020,6 +1025,13 @@ async def send_editable_wishlist(message: types.Message, user_id: int):
 
 @dp.message(F.text == "📜 Wishlist")
 async def wishlist_menu(message: types.Message):
+    if await is_paused(message.from_user.id):
+        await message.answer(
+            "You are currently on pause. Tap ▶️ Resume to manage your wishlist.",
+            reply_markup=pause_overlay_keyboard(),
+        )
+        return
+
     await send_editable_wishlist(message, message.from_user.id)
 
 
@@ -1036,6 +1048,13 @@ async def wishlist_add_prompt(message: types.Message):
 
 @dp.message(F.text == "✏️ Edit")
 async def wishlist_edit(message: types.Message):
+    if await is_paused(message.from_user.id):
+        await message.answer(
+            "You are currently on pause. Tap ▶️ Resume to edit your wishlist.",
+            reply_markup=pause_overlay_keyboard(),
+        )
+        return
+
     await send_editable_wishlist(message, message.from_user.id)
 
 
@@ -1124,7 +1143,7 @@ async def back_to_main(message: types.Message):
     set_submenu(user_id, "root")
     await message.answer(
         "Back to the main menu.",
-        reply_markup=main_keyboard(user_paused),
+        reply_markup=pause_overlay_keyboard() if user_paused else main_keyboard(False),
     )
 
 
@@ -1142,7 +1161,7 @@ async def pause_handler(message: types.Message):
         "• You can’t send links\n"
         "• You won’t receive new links from friends\n\n"
         "Tap ▶️ Resume when you want to come back.",
-        reply_markup=main_keyboard(True),
+        reply_markup=pause_overlay_keyboard(),
     )
 
 
@@ -1221,7 +1240,7 @@ async def friends_handler(message: types.Message):
         set_submenu(user_id, "root")
         await message.answer(
             "You are currently on pause. Tap ▶️ Resume to manage friends again.",
-            reply_markup=main_keyboard(True),
+            reply_markup=pause_overlay_keyboard(),
         )
         return
 
@@ -1233,8 +1252,10 @@ async def friends_handler(message: types.Message):
     header = f"You have {friend_count}/{max_friends} friends.\n\n"
 
     if friends:
-        lines = [f"- @{u}" for u in friends]
-        text = header + "Your friends:\n" + "\n".join(lines)
+        text = (
+            header
+            + "Tap a friend below to open their actions or choose an option to invite or remove."
+        )
     else:
         text = header + "You don't have any friends connected yet."
 
@@ -1732,13 +1753,13 @@ async def generic_handler(message: types.Message):
             if not delivered:
                 await message.answer(
                     "I couldn't deliver your feedback because the admin destination isn't configured yet.",
-                    reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+                    reply_markup=help_keyboard() if not user_paused else pause_overlay_keyboard(),
                 )
                 return
 
             await message.answer(
                 "Thanks! I delivered your feedback to the admin.",
-                reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+                reply_markup=help_keyboard() if not user_paused else pause_overlay_keyboard(),
             )
             return
 
@@ -1758,7 +1779,7 @@ async def generic_handler(message: types.Message):
             else:
                 await message.answer(
                     "I kept your account. You can continue using Kind Friends.",
-                    reply_markup=help_keyboard() if not user_paused else main_keyboard(True),
+                    reply_markup=help_keyboard() if not user_paused else pause_overlay_keyboard(),
                 )
                 return
 
@@ -2010,7 +2031,7 @@ async def generic_handler(message: types.Message):
         set_submenu(user_id, "root")
         await message.answer(
             "Use the buttons to open Friends or Help, or paste a link to share it with friends.",
-            reply_markup=main_keyboard(user_paused),
+            reply_markup=pause_overlay_keyboard() if user_paused else main_keyboard(False),
         )
 
 
