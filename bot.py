@@ -676,6 +676,16 @@ def link_action_keyboard(multiple: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+async def _delete_link_prompt_message(message: types.Message | None) -> None:
+    if not message:
+        return
+
+    try:
+        await message.delete()
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to delete link prompt message: {e}")
+
+
 def friend_list_keyboard(friends: list[str]) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=f"@{username}", callback_data=f"friend_card:{username}")]
@@ -1095,7 +1105,7 @@ def _wishlist_item_text(item, viewer_id: int) -> str:
 
 
 def wishlist_item_keyboard(item, viewer_id: int, is_owner: bool) -> InlineKeyboardMarkup:
-    buttons: list[list[InlineKeyboardButton]] = [[InlineKeyboardButton(text="Open", url=item["url"])]]
+    buttons: list[list[InlineKeyboardButton]] = []
     reserved_by = item.get("reserved_by_telegram_id")
 
     if is_owner:
@@ -2365,6 +2375,7 @@ async def link_action_wishlist(callback: types.CallbackQuery):
     await send_editable_wishlist(
         callback.message, callback.from_user.id, show_summary=False
     )
+    await _delete_link_prompt_message(callback.message)
     await callback.answer()
 
 
@@ -2385,12 +2396,14 @@ async def link_action_send(callback: types.CallbackQuery):
         sender_username=callback.from_user.username,
         reply_target=callback.message,
     )
+    await _delete_link_prompt_message(callback.message)
     await callback.answer()
 
 
 @dp.callback_query(F.data == "link_action:cancel")
 async def link_action_cancel(callback: types.CallbackQuery):
     pending_link_actions.pop(callback.from_user.id, None)
+    await _delete_link_prompt_message(callback.message)
     await callback.answer("Cancelled.")
 
 
