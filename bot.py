@@ -643,10 +643,10 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
         # the actual product title when possible (e.g., drop "Amazon.de" and keep the
         # product description).
         store_pattern = re.compile(
-            r"\b(amazon|etsy|ebay|walmart|aliexpress|target|zalando|shein|bestbuy)\b",
+            r"\b(amazon|etsy|ebay|walmart|aliexpress|target|zalando|shein|bestbuy|rakuten|mercado)\b",
             re.IGNORECASE,
         )
-        domain_pattern = re.compile(r"\b\w+\.\w+\b")
+        domain_pattern = re.compile(r"\b[a-z0-9-]+\.[a-z]{2,6}\b", re.IGNORECASE)
         descriptive_parts = [
             p for p in parts if not store_pattern.search(p) and not domain_pattern.search(p)
         ]
@@ -666,40 +666,64 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
             flags=re.IGNORECASE | re.DOTALL,
         )
 
+        def _normalize_image(img_val):
+            if isinstance(img_val, list):
+                if not img_val:
+                    return None
+                first = img_val[0]
+                if isinstance(first, dict):
+                    return first.get("url") or first.get("@id")
+                return first
+            if isinstance(img_val, dict):
+                return img_val.get("url") or img_val.get("@id")
+            return img_val
+
         def _walk(data):
+            best: dict[str, str | None] | None = None
+
+            def _maybe_update(candidate: dict[str, str | None]):
+                nonlocal best
+                if not candidate:
+                    return
+                if not candidate.get("title") and not candidate.get("image"):
+                    return
+                if not best:
+                    best = candidate
+                    return
+                if candidate.get("title") and (
+                    not best.get("title")
+                    or len(candidate["title"]) > len(best["title"] or "")
+                ):
+                    best = candidate
+                elif candidate.get("image") and not best.get("image"):
+                    best = {**best, "image": candidate.get("image")}
+
             if isinstance(data, list):
                 for item in data:
                     found = _walk(item)
-                    if found:
-                        return found
+                    if found and not best:
+                        best = found
             elif isinstance(data, dict):
                 type_field = data.get("@type")
                 types = [type_field] if isinstance(type_field, str) else type_field or []
                 if any(isinstance(t, str) and t.lower() == "product" for t in types):
                     name = data.get("name") or data.get("headline")
-                    image = data.get("image") or data.get("thumbnailUrl")
-                    if isinstance(image, list) and image:
-                        image = image[0]
-                    if isinstance(image, dict):
-                        image = image.get("url") or image.get("@id")
-                    return {"title": name, "image": image}
+                    image = _normalize_image(data.get("image") or data.get("thumbnailUrl"))
+                    _maybe_update({"title": name, "image": image})
 
                 if any(isinstance(t, str) and t.lower() == "offer" for t in types):
                     item_offered = data.get("itemOffered")
                     if isinstance(item_offered, dict):
                         name = item_offered.get("name") or item_offered.get("headline")
-                        image = item_offered.get("image") or item_offered.get("thumbnailUrl")
-                        if isinstance(image, list) and image:
-                            image = image[0]
-                        if isinstance(image, dict):
-                            image = image.get("url") or image.get("@id")
-                        if name or image:
-                            return {"title": name, "image": image}
+                        image = _normalize_image(
+                            item_offered.get("image") or item_offered.get("thumbnailUrl")
+                        )
+                        _maybe_update({"title": name, "image": image})
                 for value in data.values():
                     found = _walk(value)
-                    if found:
-                        return found
-            return None
+                    if found and not best:
+                        best = found
+            return best
 
         for script in scripts:
             try:
@@ -727,6 +751,34 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
         if name and content and name.lower() not in meta_map:
             meta_map[name.lower()] = content.strip()
 
+    def _search_img_tags():
+        images = []
+        for tag in re.findall(r"<img[^>]+>", html_slice, flags=re.IGNORECASE):
+            src = (
+                _extract_attr(tag, "src")
+                or _extract_attr(tag, "data-src")
+                or _extract_attr(tag, "data-original")
+            )
+            if not src:
+                continue
+            width = _extract_attr(tag, "width")
+            height = _extract_attr(tag, "height")
+            score = 0
+            try:
+                if width:
+                    score += int(width)
+                if height:
+                    score += int(height)
+            except ValueError:
+                pass
+            if re.search(r"1200|1600|2048|_UX|_SL", src):
+                score += 500
+            images.append((score, src))
+        if not images:
+            return None
+        images.sort(key=lambda x: x[0], reverse=True)
+        return images[0][1]
+
     def _search_meta(names: tuple[str, ...]):
         for name in names:
             if name.lower() in meta_map:
@@ -740,6 +792,20 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
     def _search_heading():
         match = re.search(r"<h1[^>]*>(.*?)</h1>", html_slice, re.IGNORECASE | re.DOTALL)
         return match.group(1).strip() if match else None
+
+    def _slug_from_url():
+        try:
+            path = re.sub(r"[?#].*$", "", url)
+            segments = [s for s in path.split("/") if s and not re.match(r"https?", s, re.I)]
+            candidates = []
+            for seg in segments[::-1]:
+                cleaned = re.sub(r"[-_]+", " ", seg)
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                if len(cleaned) >= 8 and re.search(r"[A-Za-z]", cleaned):
+                    candidates.append(cleaned)
+            return candidates[0] if candidates else None
+        except Exception:
+            return None
 
     structured = _extract_product_from_ld_json() or {}
 
@@ -760,6 +826,7 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
     )
     title_candidates.append(_search_title_tag())
     title_candidates.append(_search_heading())
+    title_candidates.append(_slug_from_url())
 
     title = None
     for candidate in title_candidates:
@@ -781,6 +848,8 @@ async def _fetch_metadata_for_url(session, url: str) -> dict[str, str | None]:
             "thumbnailurl",
         )
     )
+    if not image:
+        image = _search_img_tags()
     if image:
         image = urljoin(url, image)
 
