@@ -112,16 +112,16 @@ def _parse_task_action(start_param: str) -> tuple[str, int] | None:
 
 async def handle_task_deeplink(
     user_id: int, chat_id: int, start_param: str, bot: Bot
-) -> bool:
+) -> str | None:
     parsed = _parse_task_action(start_param)
     if not parsed:
-        return False
+        return None
 
     action, task_id = parsed
     todo_list = store.get_list(user_id)
     if not todo_list:
         await bot.send_message(chat_id, "Create a list first with /newlist.")
-        return True
+        return action
 
     try:
         if action == "delete":
@@ -132,10 +132,10 @@ async def handle_task_deeplink(
             store.set_task_status(user_id, task_id, False)
     except ValueError:
         await bot.send_message(chat_id, "Task not found.")
-        return True
+        return action
 
     await update_anchor(todo_list, bot)
-    return True
+    return action
 
 
 async def handle_newlist(message: Message) -> None:

@@ -1340,10 +1340,19 @@ async def cmd_start(message: types.Message):
         if len(parts) == 2:
             start_param = parts[1]
 
-    if start_param and await handle_task_deeplink(
-        message.from_user.id, message.chat.id, start_param, bot
-    ):
-        return
+    if start_param:
+        task_action = await handle_task_deeplink(
+            message.from_user.id, message.chat.id, start_param, bot
+        )
+        if task_action:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            action_label = "delete" if task_action == "delete" else task_action
+            await bot.send_message(message.chat.id, f"/{action_label}_task")
+            return
 
     if start_param:
         try:
