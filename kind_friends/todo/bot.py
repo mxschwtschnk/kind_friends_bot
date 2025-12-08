@@ -70,21 +70,20 @@ async def update_anchor(todo_list: ToDoList, bot: Bot) -> None:
     anchor = store.get_anchor(todo_list.owner_id)
     text = render_list(todo_list)
     markup = build_keyboard(todo_list)
-    if anchor:
-        chat_id, message_id = anchor
-        try:
-            await bot.edit_message_text(
-                text,
-                chat_id,
-                message_id,
-                reply_markup=markup,
-                parse_mode="MarkdownV2",
-            )
-            return
-        except Exception:
-            pass
-    target_chat = anchor[0] if anchor else todo_list.owner_id
-    await send_anchor(target_chat, todo_list, bot)
+    if not anchor:
+        return
+
+    chat_id, message_id = anchor
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id,
+            message_id,
+            reply_markup=markup,
+            parse_mode="MarkdownV2",
+        )
+    except Exception:
+        pass
 
 
 def _parse_task_action(start_param: str) -> tuple[str, int] | None:
@@ -185,7 +184,7 @@ async def handle_text(message: Message) -> None:
         store.add_task(user_id, message.text)
 
     wait_mode[user_id] = None
-    await send_anchor(message.chat.id, todo_list, message.bot)
+    await update_anchor(todo_list, message.bot)
 
 
 async def on_title(callback: CallbackQuery) -> None:
