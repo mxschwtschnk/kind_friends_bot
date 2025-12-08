@@ -31,6 +31,7 @@ from kind_friends.services.friend_service import (
     get_max_friends,
     normalize_username_input,
 )
+from kind_friends.todo.bot import register_todo_handlers, show_todo_home
 from admin_commands import register_admin_handlers
 
 settings = load_settings()
@@ -42,6 +43,7 @@ FEEDBACK_RECIPIENT_CHAT_ID = settings.feedback_recipient_chat_id
 
 bot = Bot(token=settings.bot_token)
 dp = Dispatcher()
+register_todo_handlers(dp)
 
 database = Database(settings.database_url)
 friend_service = FriendService(database, settings)
@@ -112,6 +114,7 @@ Submenu = Literal[
     "wishlist",
     "wishlist_add",
     "wishlist_delete",
+    "todo",
 ]
 current_submenu: dict[int, list[Submenu]] = {}
 
@@ -122,7 +125,7 @@ SUBMENU_PARENTS: dict[Submenu, Submenu] = {
     "wishlist_add": "wishlist",
     "wishlist_delete": "wishlist",
 }
-TOP_LEVEL_MENUS: set[Submenu] = {"friends", "wishlist", "help"}
+TOP_LEVEL_MENUS: set[Submenu] = {"friends", "wishlist", "help", "todo"}
 
 
 def set_submenu(user_id: int, submenu: Submenu) -> None:
@@ -581,11 +584,13 @@ def main_keyboard(paused: bool) -> ReplyKeyboardMarkup:
     if paused:
         keyboard = [
             [pause_button, KeyboardButton(text="🎁 Wishlist")],
+            [KeyboardButton(text="✅ To-Do")],
             [KeyboardButton(text="ℹ️ Help")],
         ]
     else:
         keyboard = [
             [pause_button, KeyboardButton(text="👥 Friends"), KeyboardButton(text="🎁 Wishlist")],
+            [KeyboardButton(text="✅ To-Do")],
             [KeyboardButton(text="ℹ️ Help")],
         ]
 
@@ -1393,6 +1398,20 @@ async def help_handler(message: types.Message):
         "Pick a help option:",
         reply_markup=help_keyboard(),
     )
+
+
+@dp.message(F.text == "✅ To-Do")
+async def todo_menu(message: types.Message):
+    user_id = message.from_user.id
+    set_submenu(user_id, "todo")
+    add_friend_mode.discard(user_id)
+    remove_friend_mode.discard(user_id)
+    remove_friend_confirmations.pop(user_id, None)
+    feedback_mode.discard(user_id)
+    delete_account_confirmation.discard(user_id)
+    wishlist_add_mode.discard(user_id)
+    wishlist_delete_confirmations.pop(user_id, None)
+    await show_todo_home(message)
 
 
 async def send_editable_wishlist(
