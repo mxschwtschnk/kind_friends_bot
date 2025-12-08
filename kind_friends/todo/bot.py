@@ -27,8 +27,12 @@ def render_list(todo_list: ToDoList) -> str:
 
     for task in todo_list.tasks:
         escaped_text = escape_md(task.text)
-        delete_link = f"https://t.me/{BOT_USERNAME}?start=del_{task.id}"
-        toggle_link = f"https://t.me/{BOT_USERNAME}?start=toggle_{task.id}"
+        delete_link = f"https://t.me/{BOT_USERNAME}?start=delete_task_{task.id}"
+        toggle_link = (
+            f"https://t.me/{BOT_USERNAME}?start=done_task_{task.id}"
+            if not task.done
+            else f"https://t.me/{BOT_USERNAME}?start=undone_task_{task.id}"
+        )
 
         delete_button = f"[❌]({delete_link})"
         toggle_button = (
@@ -84,15 +88,20 @@ async def update_anchor(todo_list: ToDoList, bot: Bot) -> None:
 
 
 def _parse_task_action(start_param: str) -> tuple[str, int] | None:
-    if start_param.startswith("toggle_"):
-        action = "toggle"
-    elif start_param.startswith("del_"):
+    if start_param.startswith("delete_task_"):
         action = "delete"
+        payload = start_param.removeprefix("delete_task_")
+    elif start_param.startswith("done_task_"):
+        action = "done"
+        payload = start_param.removeprefix("done_task_")
+    elif start_param.startswith("undone_task_"):
+        action = "undone"
+        payload = start_param.removeprefix("undone_task_")
     else:
         return None
 
     try:
-        task_id = int(start_param.split("_", 1)[1])
+        task_id = int(payload)
     except ValueError:
         return None
 
@@ -113,10 +122,12 @@ async def handle_task_deeplink(
         return True
 
     try:
-        if action == "toggle":
-            store.toggle_task(user_id, task_id)
-        else:
+        if action == "delete":
             store.delete_task(user_id, task_id)
+        elif action == "done":
+            store.set_task_status(user_id, task_id, True)
+        else:
+            store.set_task_status(user_id, task_id, False)
     except ValueError:
         await bot.send_message(chat_id, "Task not found.")
         return True
