@@ -185,7 +185,7 @@ async def handle_text(message: Message) -> None:
         store.add_task(user_id, message.text)
 
     wait_mode[user_id] = None
-    await send_anchor(message.chat.id, todo_list, message.bot)
+    await update_anchor(todo_list, message.bot)
 
 
 async def on_title(callback: CallbackQuery) -> None:
