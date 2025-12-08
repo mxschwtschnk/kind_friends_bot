@@ -34,9 +34,11 @@ def render_list(todo_list: ToDoList) -> str:
             else f"https://t.me/{BOT_USERNAME}?start=undone_task_{task.id}"
         )
 
-        delete_button = f"[❌]({delete_link})"
+        delete_button = f"[❌ /delete\_task]({delete_link})"
         toggle_button = (
-            f"[☑️]({toggle_link})" if task.done else f"[◻️]({toggle_link})"
+            f"[☑️ /undone\_task]({toggle_link})"
+            if task.done
+            else f"[◻️ /done\_task]({toggle_link})"
         )
 
         task_text = f"~{escaped_text}~" if task.done else escaped_text
