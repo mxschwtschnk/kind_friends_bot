@@ -31,7 +31,11 @@ from kind_friends.services.friend_service import (
     get_max_friends,
     normalize_username_input,
 )
-from kind_friends.todo.bot import register_todo_handlers, show_todo_home
+from kind_friends.todo.bot import (
+    handle_task_deeplink,
+    register_todo_handlers,
+    show_todo_home,
+)
 from admin_commands import register_admin_handlers
 
 settings = load_settings()
@@ -1326,17 +1330,35 @@ async def cmd_start(message: types.Message):
     )
     set_submenu(message.from_user.id, "root")
 
-    # Handle deep-link invitation (/start <inviter_id>)
+    # Handle deep-link invitation (/start <inviter_id>) or todo task actions
     inviter_id: int | None = None
     inviter_display_name: str | None = None
+    start_param: str | None = None
 
     if message.text:
         parts = message.text.split(maxsplit=1)
         if len(parts) == 2:
+            start_param = parts[1]
+
+    if start_param:
+        task_action = await handle_task_deeplink(
+            message.from_user.id, message.chat.id, start_param, bot
+        )
+        if task_action:
             try:
-                inviter_id = int(parts[1])
-            except ValueError:
-                inviter_id = None
+                await message.delete()
+            except Exception:
+                pass
+
+            action_label = "delete" if task_action == "delete" else task_action
+            await bot.send_message(message.chat.id, f"/{action_label}_task")
+            return
+
+    if start_param:
+        try:
+            inviter_id = int(start_param)
+        except ValueError:
+            inviter_id = None
 
     if inviter_id and inviter_id != message.from_user.id:
         async with pool.acquire() as conn:

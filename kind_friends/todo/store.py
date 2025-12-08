@@ -56,6 +56,11 @@ class ListStore:
         task.done = not task.done
         return task
 
+    def set_task_status(self, user_id: int, task_id: int, done: bool) -> Task:
+        task = self._get_task(user_id, task_id)
+        task.done = done
+        return task
+
     def delete_task(self, user_id: int, task_id: int) -> None:
         todo_list = self._require_list(user_id)
         todo_list.tasks = [task for task in todo_list.tasks if task.id != task_id]

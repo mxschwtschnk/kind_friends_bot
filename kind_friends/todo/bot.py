@@ -5,9 +5,12 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from kind_friends.todo.store import ListStore, Task, ToDoList
+from kind_friends.config import load_settings
 
 store = ListStore()
 wait_mode: dict[int, Optional[str]] = {}
+settings = load_settings()
+BOT_USERNAME = settings.bot_username
 
 
 def escape_md(text: str) -> str:
@@ -24,20 +27,24 @@ def render_list(todo_list: ToDoList) -> str:
 
     for task in todo_list.tasks:
         escaped_text = escape_md(task.text)
-        if task.done:
-            lines.append(f"❌ ☑ ~{escaped_text}~")
-        else:
-            lines.append(f"❌ ☐ {escaped_text}")
+        delete_link = f"https://t.me/{BOT_USERNAME}?start=delete_task_{task.id}"
+        toggle_link = (
+            f"https://t.me/{BOT_USERNAME}?start=done_task_{task.id}"
+            if not task.done
+            else f"https://t.me/{BOT_USERNAME}?start=undone_task_{task.id}"
+        )
+
+        delete_button = f"[❌ /delete\_task]({delete_link})"
+        toggle_button = (
+            f"[☑️ /undone\_task]({toggle_link})"
+            if task.done
+            else f"[◻️ /done\_task]({toggle_link})"
+        )
+
+        task_text = f"~{escaped_text}~" if task.done else escaped_text
+        lines.append(f"{delete_button} {toggle_button} {task_text}")
 
     return "\n".join(lines)
-
-
-def task_buttons(task: Task) -> list[InlineKeyboardButton]:
-    toggle_text = "☑" if task.done else "☐"
-    return [
-        InlineKeyboardButton(text="❌", callback_data=f"task:del:{task.id}"),
-        InlineKeyboardButton(text=toggle_text, callback_data=f"task:toggle:{task.id}"),
-    ]
 
 
 def main_buttons() -> list[list[InlineKeyboardButton]]:
@@ -49,11 +56,7 @@ def main_buttons() -> list[list[InlineKeyboardButton]]:
 
 
 def build_keyboard(todo_list: ToDoList) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for task in todo_list.tasks:
-        rows.append(task_buttons(task))
-    rows.extend(main_buttons())
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(inline_keyboard=main_buttons())
 
 
 async def send_anchor(chat_id: int, todo_list: ToDoList, bot: Bot) -> None:
@@ -84,6 +87,55 @@ async def update_anchor(todo_list: ToDoList, bot: Bot) -> None:
             pass
     target_chat = anchor[0] if anchor else todo_list.owner_id
     await send_anchor(target_chat, todo_list, bot)
+
+
+def _parse_task_action(start_param: str) -> tuple[str, int] | None:
+    if start_param.startswith("delete_task_"):
+        action = "delete"
+        payload = start_param.removeprefix("delete_task_")
+    elif start_param.startswith("done_task_"):
+        action = "done"
+        payload = start_param.removeprefix("done_task_")
+    elif start_param.startswith("undone_task_"):
+        action = "undone"
+        payload = start_param.removeprefix("undone_task_")
+    else:
+        return None
+
+    try:
+        task_id = int(payload)
+    except ValueError:
+        return None
+
+    return action, task_id
+
+
+async def handle_task_deeplink(
+    user_id: int, chat_id: int, start_param: str, bot: Bot
+) -> str | None:
+    parsed = _parse_task_action(start_param)
+    if not parsed:
+        return None
+
+    action, task_id = parsed
+    todo_list = store.get_list(user_id)
+    if not todo_list:
+        await bot.send_message(chat_id, "Create a list first with /newlist.")
+        return action
+
+    try:
+        if action == "delete":
+            store.delete_task(user_id, task_id)
+        elif action == "done":
+            store.set_task_status(user_id, task_id, True)
+        else:
+            store.set_task_status(user_id, task_id, False)
+    except ValueError:
+        await bot.send_message(chat_id, "Task not found.")
+        return action
+
+    await update_anchor(todo_list, bot)
+    return action
 
 
 async def handle_newlist(message: Message) -> None:
