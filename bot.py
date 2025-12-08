@@ -1349,9 +1349,6 @@ async def cmd_start(message: types.Message):
                 await message.delete()
             except Exception:
                 pass
-
-            action_label = "delete" if task_action == "delete" else task_action
-            await bot.send_message(message.chat.id, f"/{action_label}_task")
             return
 
     if start_param:
