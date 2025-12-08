@@ -3,12 +3,16 @@ from typing import Optional
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from aiogram.utils.markdown import escape_md
 
 from kind_friends.todo.store import ListStore, Task, ToDoList
 
 store = ListStore()
 wait_mode: dict[int, Optional[str]] = {}
+
+
+def escape_md(text: str) -> str:
+    escape_chars = r"\\_*[]()~`>#+-=|{}.!"
+    return "".join(f"\\{c}" if c in escape_chars else c for c in text)
 
 
 def render_list(todo_list: ToDoList) -> str:
