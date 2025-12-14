@@ -8,9 +8,6 @@ def register_admin_handlers(dp, bot, settings, database, generic_handler):
 
     @dp.message(F.text == "/admin")
     async def admin_handler(message: types.Message):
-        """
-        Simple admin stats, available only for ADMIN_ID.
-        """
         if message.from_user.id != ADMIN_ID:
             return
 
@@ -42,8 +39,6 @@ def register_admin_handlers(dp, bot, settings, database, generic_handler):
 
     @dp.message(F.text == "/testitnow")
     async def test_it_now_handler(message: types.Message):
-        """Admin self-check command. Verifies link flow without broadcasting to users."""
-
         if message.from_user.id != ADMIN_ID:
             return
 
@@ -119,11 +114,6 @@ def register_admin_handlers(dp, bot, settings, database, generic_handler):
         F.text.startswith("/broadcast") | F.caption.startswith("/broadcast")
     )
     async def broadcast_handler(message: types.Message):
-        """
-        Broadcast a text message to all registered users, optionally with a photo.
-        Only the configured ADMIN_ID can use this command.
-        """
-
         if message.from_user.id != ADMIN_ID:
             return
 

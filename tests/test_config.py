@@ -5,6 +5,7 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from handlers.state import BotState
 from kind_friends.config import SettingsLoaderError, _parse_id_list
 
 
@@ -29,3 +30,12 @@ def test_parse_id_list_ignores_empty_quoted_space_entries():
 def test_parse_id_list_invalid_value_raises_error():
     with pytest.raises(SettingsLoaderError):
         _parse_id_list("not-a-number", "ALPHA_USERS")
+
+
+def test_bot_state_tracks_menu_history():
+    state = BotState()
+    state.set_submenu(42, "friends")
+    state.set_submenu(42, "friends_invite")
+    assert state.get_submenu(42) == "friends_invite"
+    assert state.pop_submenu(42) == "friends"
+    assert state.get_submenu(42) == "friends"

@@ -7,6 +7,7 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from handlers.links import extract_urls_from_text
 from kind_friends.config import Settings
 from kind_friends.services.friend_service import (
     FriendInviteDecision,
@@ -157,3 +158,10 @@ def test_remove_friend_and_delete_user(service: FriendService):
     asyncio.run(service.delete_user(3))
     assert service.repo.removed == [(1, 2)]
     assert service.repo.deleted == [3]
+
+
+def test_extract_urls_from_text_parses_bare_and_protocol_urls():
+    urls = extract_urls_from_text("Check https://example.com and example.org/page plus www.site.io")
+    assert "https://example.com" in urls
+    assert "https://example.org/page" in urls
+    assert "https://www.site.io" in urls
